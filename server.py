@@ -13,6 +13,11 @@ import bcrypt
 import jwt
 import cloudinary
 import cloudinary.uploader
+import razorpay
+import resend
+import asyncio
+import hmac
+import hashlib
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, UploadFile, File, Form
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -25,7 +30,7 @@ JWT_SECRET = os.environ["JWT_SECRET"]
 ADMIN_EMAIL = os.environ["ADMIN_EMAIL"]
 ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
 APP_NAME = os.environ.get("APP_NAME", "royalcars")
-FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
 
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_MINUTES = 60 * 24  # 1 day for smooth demo
@@ -37,6 +42,16 @@ cloudinary.config(
     api_secret=os.environ.get("CLOUDINARY_API_SECRET"),
     secure=True,
 )
+
+RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET")
+RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET") or ""
+razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)) if RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET else None
+
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "Royal Cars <onboarding@resend.dev>")
+if RESEND_API_KEY:
+    resend.api_key = RESEND_API_KEY
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
@@ -180,16 +195,134 @@ class KYCVerifyPayload(BaseModel):
 
 class PaymentInitPayload(BaseModel):
     booking_id: str
-    payment_type: Literal["full", "partial"]
+    payment_type: Literal["full", "partial", "balance"]
 
 
 class PaymentVerifyPayload(BaseModel):
     booking_id: str
-    payment_id: str
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
 
 
 class BookingStatusPayload(BaseModel):
     status: Literal["pending_kyc", "verified", "confirmed", "active", "completed", "cancelled"]
+
+
+# ------------- Email (Resend) -------------
+def _format_inr(amount) -> str:
+    try:
+        return f"₹{int(round(float(amount))):,}"
+    except Exception:
+        return f"₹{amount}"
+
+
+def _email_layout(title: str, body_html: str, cta: Optional[dict] = None) -> str:
+    cta_html = ""
+    if cta:
+        cta_html = f"""
+        <tr><td style="padding:24px 32px 0 32px;">
+          <a href="{cta['url']}" style="display:inline-block;background:#0A192F;color:#ffffff;text-decoration:none;padding:12px 22px;border-radius:6px;font-weight:600;font-family:Helvetica,Arial,sans-serif;font-size:14px;letter-spacing:0.02em;">{cta['label']}</a>
+        </td></tr>
+        """
+    return f"""<!doctype html>
+<html><body style="margin:0;padding:0;background:#FAFAFA;font-family:Helvetica,Arial,sans-serif;color:#0A192F;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#FAFAFA;padding:32px 0;">
+    <tr><td align="center">
+      <table width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border:1px solid #E2E8F0;border-radius:8px;overflow:hidden;">
+        <tr><td style="padding:24px 32px;border-bottom:3px solid #D4AF37;">
+          <div style="font-size:24px;font-weight:700;letter-spacing:-0.01em;color:#0A192F;">Royal Cars</div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.2em;color:#64748B;margin-top:2px;">Premium fleet · Navi Mumbai</div>
+        </td></tr>
+        <tr><td style="padding:32px;">
+          <h1 style="margin:0 0 8px 0;font-size:22px;font-weight:700;color:#0A192F;">{title}</h1>
+          {body_html}
+        </td></tr>
+        {cta_html}
+        <tr><td style="padding:24px 32px;background:#F8FAFC;border-top:1px solid #E2E8F0;font-size:12px;color:#64748B;">
+          Need help? Reply to this email or call us at the pickup location.<br>
+          © {datetime.now(timezone.utc).year} Royal Cars · Kharghar · Panvel
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>"""
+
+
+def _booking_summary_table(booking: dict, location_name_map: dict) -> str:
+    pickup_loc = location_name_map.get(booking.get("pickup_location_id"), "—")
+    dropoff_loc = location_name_map.get(booking.get("dropoff_location_id"), "—")
+    rows = [
+        ("Booking ID", f"#{booking['id'][:8]}"),
+        ("Vehicle", booking.get("vehicle_name", "—")),
+        ("Pickup", f"{pickup_loc} · {booking.get('pickup_date')} {booking.get('pickup_time')}"),
+        ("Drop-off", f"{dropoff_loc} · {booking.get('dropoff_date')} {booking.get('dropoff_time')}"),
+        ("Rent", _format_inr(booking.get("rent_amount"))),
+        ("Refundable deposit", _format_inr(booking.get("deposit_amount"))),
+        ("Total", _format_inr(booking.get("total_amount"))),
+    ]
+    if booking.get("paid_amount", 0) > 0:
+        rows.append(("Paid", _format_inr(booking.get("paid_amount"))))
+    if booking.get("balance_amount", 0) > 0:
+        rows.append(("Balance due at pickup", _format_inr(booking.get("balance_amount"))))
+    table_rows = "".join(
+        f'<tr><td style="padding:8px 0;color:#64748B;font-size:13px;">{k}</td>'
+        f'<td style="padding:8px 0;text-align:right;font-size:13px;color:#0A192F;font-weight:600;">{v}</td></tr>'
+        for k, v in rows
+    )
+    return f'<table width="100%" cellpadding="0" cellspacing="0" style="margin-top:16px;border-top:1px solid #E2E8F0;">{table_rows}</table>'
+
+
+async def _send_email(to: str, subject: str, html: str):
+    if not RESEND_API_KEY or not to:
+        return
+    try:
+        await asyncio.to_thread(
+            resend.Emails.send,
+            {"from": SENDER_EMAIL, "to": [to], "subject": subject, "html": html},
+        )
+        logger.info(f"email sent to {to} | {subject}")
+    except Exception as e:
+        # never block the request; just log
+        logger.warning(f"email send failed for {to}: {e}")
+
+
+async def send_booking_received_email(user: dict, booking: dict):
+    locs = await db.locations.find({"id": {"$in": [booking.get("pickup_location_id"), booking.get("dropoff_location_id")]}}, {"_id": 0, "id": 1, "name": 1}).to_list(10)
+    name_map = {l["id"]: l["name"] for l in locs}
+    body = f"""
+      <p style="margin:0 0 12px 0;font-size:14px;line-height:1.55;color:#334155;">Hi {user.get('name', 'there').split(' ')[0]},</p>
+      <p style="margin:0 0 12px 0;font-size:14px;line-height:1.55;color:#334155;">
+        We've received your booking request for <b>{booking.get('vehicle_name')}</b>. Your KYC documents will be reviewed by our fleet team and you'll receive a confirmation email once payment is complete.
+      </p>
+      {_booking_summary_table(booking, name_map)}
+    """
+    html = _email_layout("Booking received", body, cta={
+        "url": f"{FRONTEND_URL}/dashboard",
+        "label": "View my bookings",
+    })
+    await _send_email(user["email"], f"Booking received · {booking.get('vehicle_name')}", html)
+
+
+async def send_booking_confirmed_email(user: dict, booking: dict, payment_kind: str = "full"):
+    locs = await db.locations.find({"id": {"$in": [booking.get("pickup_location_id"), booking.get("dropoff_location_id")]}}, {"_id": 0, "id": 1, "name": 1}).to_list(10)
+    name_map = {l["id"]: l["name"] for l in locs}
+    blurb = "Your booking is now confirmed and the vehicle is reserved for you."
+    if payment_kind == "partial" and booking.get("balance_amount", 0) > 0:
+        blurb += f" The remaining balance of {_format_inr(booking['balance_amount'])} will be collected at pickup."
+    body = f"""
+      <p style="margin:0 0 12px 0;font-size:14px;line-height:1.55;color:#334155;">Hi {user.get('name', 'there').split(' ')[0]},</p>
+      <p style="margin:0 0 12px 0;font-size:14px;line-height:1.55;color:#334155;">{blurb}</p>
+      {_booking_summary_table(booking, name_map)}
+      <p style="margin:18px 0 0 0;font-size:13px;line-height:1.55;color:#64748B;">
+        Please carry your original Driving License at pickup. We'll see you at the mall!
+      </p>
+    """
+    html = _email_layout("🎉 Booking confirmed", body, cta={
+        "url": f"{FRONTEND_URL}/dashboard",
+        "label": "View booking",
+    })
+    await _send_email(user["email"], f"Booking confirmed · {booking.get('vehicle_name')}", html)
 
 
 # ------------- Cloudinary upload helper -------------
@@ -534,11 +667,24 @@ def compute_rent(price_per_24hrs: float, pickup_dt: datetime, dropoff_dt: dateti
     return round(price_per_24hrs * days, 2)
 
 
+def _validate_business_hours(t: str):
+    """Pickup/drop-off must be between 05:00 and 23:00 inclusive."""
+    try:
+        hh, mm = (int(x) for x in t.split(":")[:2])
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid time format")
+    minutes = hh * 60 + mm
+    if minutes < 5 * 60 or minutes > 23 * 60:
+        raise HTTPException(status_code=400, detail="Pickup and drop-off must be between 5:00 AM and 11:00 PM")
+
+
 @api_router.post("/bookings")
 async def create_booking(payload: BookingIn, user: dict = Depends(get_current_user)):
     vehicle = await db.vehicles.find_one({"id": payload.vehicle_id}, {"_id": 0})
     if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle not found")
+    _validate_business_hours(payload.pickup_time)
+    _validate_business_hours(payload.dropoff_time)
     try:
         pickup_dt = datetime.fromisoformat(f"{payload.pickup_date}T{payload.pickup_time}")
         dropoff_dt = datetime.fromisoformat(f"{payload.dropoff_date}T{payload.dropoff_time}")
@@ -578,6 +724,8 @@ async def create_booking(payload: BookingIn, user: dict = Depends(get_current_us
     }
     await db.bookings.insert_one(doc)
     doc.pop("_id", None)
+    # Fire-and-forget email — never block the booking response
+    asyncio.create_task(send_booking_received_email(user, doc))
     return doc
 
 
@@ -625,64 +773,286 @@ async def update_booking_status(booking_id: str, payload: BookingStatusPayload, 
     return b
 
 
-# ------------- Payments (mock Razorpay) -------------
+# ------------- Payments (Razorpay) -------------
+def _ensure_razorpay():
+    if not razorpay_client:
+        raise HTTPException(status_code=500, detail="Razorpay not configured on server")
+
+
+async def _get_or_create_razorpay_customer(user: dict) -> Optional[str]:
+    existing = user.get("razorpay_customer_id")
+    if existing:
+        return existing
+    try:
+        cust = razorpay_client.customer.create({
+            "name": user.get("name") or "Customer",
+            "email": user["email"],
+            "contact": user.get("phone") or "",
+            "fail_existing": "0",
+        })
+        cid = cust.get("id")
+        if cid:
+            await db.users.update_one({"id": user["id"]}, {"$set": {"razorpay_customer_id": cid}})
+        return cid
+    except Exception as e:
+        logger.warning(f"Razorpay customer create failed: {e}")
+        return None
+
+
 @api_router.post("/payments/init")
 async def payment_init(payload: PaymentInitPayload, user: dict = Depends(get_current_user)):
+    _ensure_razorpay()
     booking = await db.bookings.find_one({"id": payload.booking_id}, {"_id": 0})
     if not booking or booking["user_id"] != user["id"]:
         raise HTTPException(status_code=404, detail="Booking not found")
-    if booking["status"] not in {"verified", "confirmed"}:
+    if booking["status"] not in {"verified", "confirmed", "active"}:
         raise HTTPException(status_code=400, detail="Booking not ready for payment. KYC must be approved first.")
-    amount = booking["total_amount"] if payload.payment_type == "full" else round(booking["total_amount"] * 0.2, 2)
-    order_id = f"order_mock_{uuid.uuid4().hex[:12]}"
+
+    if payload.payment_type == "full":
+        amount = booking["total_amount"] - booking.get("paid_amount", 0)
+        record_type = "full"
+    elif payload.payment_type == "partial":
+        if booking.get("paid_amount", 0) > 0:
+            raise HTTPException(status_code=400, detail="Partial payment already made")
+        amount = round(booking["total_amount"] * 0.2, 2)
+        record_type = "partial_advance"
+    else:  # balance
+        amount = booking.get("balance_amount", 0)
+        if amount <= 0:
+            raise HTTPException(status_code=400, detail="No balance due")
+        record_type = "balance"
+
+    amount_paise = int(round(amount * 100))
+    customer_id = await _get_or_create_razorpay_customer(user)
+
+    receipt = f"bk_{payload.booking_id[:30]}"
+    order_opts = {
+        "amount": amount_paise,
+        "currency": "INR",
+        "receipt": receipt,
+        "payment_capture": 1,
+        "notes": {
+            "booking_id": booking["id"],
+            "user_id": user["id"],
+            "payment_type": record_type,
+        },
+    }
+    try:
+        order = razorpay_client.order.create(order_opts)
+    except Exception as e:
+        logger.error(f"Razorpay order create failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Payment init failed: {e}")
+
     await db.payments.insert_one({
         "id": str(uuid.uuid4()),
         "booking_id": payload.booking_id,
         "amount": amount,
-        "payment_type": "full" if payload.payment_type == "full" else "partial_advance",
-        "razorpay_order_id": order_id,
+        "payment_type": record_type,
+        "razorpay_order_id": order["id"],
         "razorpay_payment_id": None,
+        "razorpay_customer_id": customer_id,
         "status": "pending",
+        "is_balance_charge": record_type == "balance",
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
-    return {"order_id": order_id, "amount": amount, "currency": "INR", "key": "rzp_test_mock"}
+
+    return {
+        "order_id": order["id"],
+        "amount": amount_paise,
+        "currency": "INR",
+        "key": RAZORPAY_KEY_ID,
+        "customer_id": customer_id,
+        "save_token": payload.payment_type == "partial",
+        "prefill": {
+            "name": user.get("name") or "",
+            "email": user["email"],
+            "contact": user.get("phone") or "",
+        },
+        "notes": order_opts["notes"],
+    }
 
 
 @api_router.post("/payments/verify")
 async def payment_verify(payload: PaymentVerifyPayload, user: dict = Depends(get_current_user)):
+    _ensure_razorpay()
     booking = await db.bookings.find_one({"id": payload.booking_id}, {"_id": 0})
     if not booking or booking["user_id"] != user["id"]:
         raise HTTPException(status_code=404, detail="Booking not found")
-    # Mark most recent pending payment as success
+
+    try:
+        razorpay_client.utility.verify_payment_signature({
+            "razorpay_order_id": payload.razorpay_order_id,
+            "razorpay_payment_id": payload.razorpay_payment_id,
+            "razorpay_signature": payload.razorpay_signature,
+        })
+    except razorpay.errors.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Payment signature verification failed")
+
+    # Fetch payment to capture token_id (saved card) if any
+    token_id = None
+    try:
+        p = razorpay_client.payment.fetch(payload.razorpay_payment_id)
+        token_id = p.get("token_id")
+    except Exception as e:
+        logger.warning(f"Payment fetch failed: {e}")
+
     pending = await db.payments.find_one(
-        {"booking_id": payload.booking_id, "status": "pending"},
+        {"razorpay_order_id": payload.razorpay_order_id, "status": "pending"},
         sort=[("created_at", -1)],
     )
     if not pending:
-        raise HTTPException(status_code=400, detail="No pending payment")
-    paid_amount = booking.get("paid_amount", 0) + pending["amount"]
-    balance = round(booking["total_amount"] - paid_amount, 2)
+        raise HTTPException(status_code=400, detail="Order not found or already processed")
+
     await db.payments.update_one(
         {"id": pending["id"]},
         {"$set": {
-            "razorpay_payment_id": payload.payment_id,
+            "razorpay_payment_id": payload.razorpay_payment_id,
+            "razorpay_signature": payload.razorpay_signature,
+            "razorpay_token_id": token_id,
             "status": "success",
             "paid_at": datetime.now(timezone.utc).isoformat(),
         }},
     )
-    new_status = "confirmed"
-    payment_type = "full" if abs(balance) < 0.01 else "partial"
-    await db.bookings.update_one(
-        {"id": payload.booking_id},
-        {"$set": {
-            "status": new_status,
-            "paid_amount": paid_amount,
-            "balance_amount": max(balance, 0),
-            "payment_type": payment_type,
-        }},
-    )
-    b = await db.bookings.find_one({"id": payload.booking_id}, {"_id": 0})
-    return b
+
+    paid_amount = round(booking.get("paid_amount", 0) + pending["amount"], 2)
+    balance = round(booking["total_amount"] - paid_amount, 2)
+    update = {
+        "status": "confirmed",
+        "paid_amount": paid_amount,
+        "balance_amount": max(balance, 0),
+        "payment_type": "full" if abs(balance) < 0.01 else "partial",
+    }
+    if token_id and pending.get("payment_type") == "partial_advance":
+        update["razorpay_token_id"] = token_id
+        update["razorpay_customer_id"] = pending.get("razorpay_customer_id")
+    await db.bookings.update_one({"id": payload.booking_id}, {"$set": update})
+    fresh = await db.bookings.find_one({"id": payload.booking_id}, {"_id": 0})
+    payment_kind = "partial" if fresh.get("balance_amount", 0) > 0 else "full"
+    asyncio.create_task(send_booking_confirmed_email(user, fresh, payment_kind=payment_kind))
+    return fresh
+
+
+@api_router.post("/admin/bookings/{booking_id}/charge-balance")
+async def admin_charge_balance(booking_id: str, admin: dict = Depends(require_admin)):
+    _ensure_razorpay()
+    booking = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    balance = booking.get("balance_amount", 0)
+    if balance <= 0:
+        raise HTTPException(status_code=400, detail="No balance due")
+    customer_id = booking.get("razorpay_customer_id")
+    token_id = booking.get("razorpay_token_id")
+    if not customer_id or not token_id:
+        raise HTTPException(status_code=400, detail="No saved payment method on this booking. Collect at pickup manually or mark paid.")
+
+    user = await db.users.find_one({"id": booking["user_id"]}, {"_id": 0, "password_hash": 0})
+    balance_paise = int(round(balance * 100))
+    try:
+        order = razorpay_client.order.create({
+            "amount": balance_paise,
+            "currency": "INR",
+            "receipt": f"bal_{booking_id[:30]}",
+            "payment_capture": 1,
+            "notes": {"booking_id": booking_id, "type": "balance_charge"},
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Order create failed: {e}")
+
+    try:
+        result = razorpay_client.payment.create_recurring_payment({
+            "email": user["email"],
+            "contact": user.get("phone") or "",
+            "amount": balance_paise,
+            "currency": "INR",
+            "order_id": order["id"],
+            "customer_id": customer_id,
+            "token": token_id,
+            "recurring": "1",
+            "description": f"Balance for booking {booking_id[:8]}",
+        })
+    except Exception as e:
+        logger.error(f"Recurring payment failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Auto-charge failed: {str(e)[:200]}. Customer can pay at pickup.")
+
+    payment_id = result.get("razorpay_payment_id") or result.get("id")
+    await db.payments.insert_one({
+        "id": str(uuid.uuid4()),
+        "booking_id": booking_id,
+        "amount": balance,
+        "payment_type": "balance",
+        "razorpay_order_id": order["id"],
+        "razorpay_payment_id": payment_id,
+        "razorpay_customer_id": customer_id,
+        "status": "success",
+        "is_balance_charge": True,
+        "paid_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    await db.bookings.update_one({"id": booking_id}, {"$set": {
+        "paid_amount": booking["total_amount"],
+        "balance_amount": 0,
+        "payment_type": "full",
+    }})
+    return {"ok": True, "payment_id": payment_id}
+
+
+@api_router.post("/admin/bookings/{booking_id}/mark-balance-paid")
+async def admin_mark_balance_paid(booking_id: str, admin: dict = Depends(require_admin)):
+    """Manual cash-at-pickup fallback: mark the remaining balance as paid without Razorpay."""
+    booking = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    balance = booking.get("balance_amount", 0)
+    if balance <= 0:
+        raise HTTPException(status_code=400, detail="No balance due")
+    await db.payments.insert_one({
+        "id": str(uuid.uuid4()),
+        "booking_id": booking_id,
+        "amount": balance,
+        "payment_type": "balance_cash",
+        "razorpay_order_id": None,
+        "razorpay_payment_id": None,
+        "status": "success",
+        "is_balance_charge": True,
+        "paid_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    await db.bookings.update_one({"id": booking_id}, {"$set": {
+        "paid_amount": booking["total_amount"],
+        "balance_amount": 0,
+        "payment_type": "full",
+    }})
+    return {"ok": True}
+
+
+@api_router.post("/payments/webhook")
+async def razorpay_webhook(request: Request):
+    """Idempotent async confirmation. Only active when RAZORPAY_WEBHOOK_SECRET is set."""
+    if not RAZORPAY_WEBHOOK_SECRET:
+        return {"status": "webhook_disabled"}
+    body = await request.body()
+    signature = request.headers.get("X-Razorpay-Signature", "")
+    expected = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    import json as _json
+    event = _json.loads(body.decode())
+    event_type = event.get("event")
+    entity = (event.get("payload", {}).get("payment") or {}).get("entity") or {}
+    payment_id = entity.get("id")
+    order_id = entity.get("order_id")
+    if event_type == "payment.captured" and order_id:
+        await db.payments.update_one(
+            {"razorpay_order_id": order_id},
+            {"$set": {"razorpay_payment_id": payment_id, "status": "success", "webhook_captured_at": datetime.now(timezone.utc).isoformat()}},
+        )
+    elif event_type == "payment.failed" and order_id:
+        await db.payments.update_one(
+            {"razorpay_order_id": order_id},
+            {"$set": {"status": "failed", "webhook_failed_at": datetime.now(timezone.utc).isoformat()}},
+        )
+    return {"status": "processed"}
 
 
 @api_router.get("/admin/payments")
@@ -753,7 +1123,7 @@ async def root():
 # ------------- Mount & CORS -------------
 app.include_router(api_router)
 
-cors_origins = [FRONTEND_URL, "http://localhost:5173"]
+cors_origins = [FRONTEND_URL, "http://localhost:3000"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
