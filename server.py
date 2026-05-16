@@ -30,7 +30,8 @@ JWT_SECRET = os.environ["JWT_SECRET"]
 ADMIN_EMAIL = os.environ["ADMIN_EMAIL"]
 ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
 APP_NAME = os.environ.get("APP_NAME", "royalcars")
-FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://royalrentalcars.in")
+# FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://royalrentalcars.in")
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
 
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_MINUTES = 60 * 24  # 1 day for smooth demo
@@ -198,6 +199,10 @@ class PaymentInitPayload(BaseModel):
     payment_type: Literal["full", "partial", "balance"]
 
 
+class PayAtSitePayload(BaseModel):
+    booking_id: str
+
+
 class PaymentVerifyPayload(BaseModel):
     booking_id: str
     razorpay_order_id: str
@@ -207,6 +212,22 @@ class PaymentVerifyPayload(BaseModel):
 
 class BookingStatusPayload(BaseModel):
     status: Literal["pending_kyc", "verified", "confirmed", "active", "completed", "cancelled"]
+
+
+class StartRidePayload(BaseModel):
+    odometer_start: float = Field(..., ge=0, description="Starting odometer reading in km")
+    fuel_level_start: Optional[str] = Field(None, description="Starting fuel level e.g. 'Full', '3/4', '1/2', '1/4'")
+    photo_urls: List[str] = Field(default=[], description="Pickup condition photo URLs")
+    notes: Optional[str] = None
+
+
+class EndRidePayload(BaseModel):
+    odometer_end: float = Field(..., ge=0, description="Ending odometer reading in km")
+    fuel_level_end: Optional[str] = Field(None, description="Ending fuel level")
+    photo_urls: List[str] = Field(default=[], description="Return condition photo URLs")
+    notes: Optional[str] = None
+    extra_charges: float = Field(default=0, ge=0, description="Manual extra charges (damage, cleaning, etc.)")
+    extra_charges_reason: Optional[str] = None
 
 
 # ------------- Email (Resend) -------------
@@ -310,6 +331,8 @@ async def send_booking_confirmed_email(user: dict, booking: dict, payment_kind: 
     blurb = "Your booking is now confirmed and the vehicle is reserved for you."
     if payment_kind == "partial" and booking.get("balance_amount", 0) > 0:
         blurb += f" The remaining balance of {_format_inr(booking['balance_amount'])} will be collected at pickup."
+    elif payment_kind == "pay_at_site":
+        blurb += f" The total amount of {_format_inr(booking['total_amount'])} will be collected at pickup."
     body = f"""
       <p style="margin:0 0 12px 0;font-size:14px;line-height:1.55;color:#334155;">Hi {user.get('name', 'there').split(' ')[0]},</p>
       <p style="margin:0 0 12px 0;font-size:14px;line-height:1.55;color:#334155;">{blurb}</p>
@@ -323,6 +346,61 @@ async def send_booking_confirmed_email(user: dict, booking: dict, payment_kind: 
         "label": "View booking",
     })
     await _send_email(user["email"], f"Booking confirmed · {booking.get('vehicle_name')}", html)
+
+
+async def _send_ride_started_email(user: dict, booking: dict):
+    body = f"""
+      <p style="margin:0 0 12px 0;font-size:14px;line-height:1.55;color:#334155;">Hi {user.get('name', 'there').split(' ')[0]},</p>
+      <p style="margin:0 0 12px 0;font-size:14px;line-height:1.55;color:#334155;">
+        Your ride with <b>{booking.get('vehicle_name')}</b> has started! 🚗
+      </p>
+      <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:16px;border-top:1px solid #E2E8F0;">
+        <tr><td style="padding:8px 0;color:#64748B;font-size:13px;">Booking ID</td>
+            <td style="padding:8px 0;text-align:right;font-size:13px;color:#0A192F;font-weight:600;">#{booking['id'][:8]}</td></tr>
+        <tr><td style="padding:8px 0;color:#64748B;font-size:13px;">Vehicle</td>
+            <td style="padding:8px 0;text-align:right;font-size:13px;color:#0A192F;font-weight:600;">{booking.get('vehicle_name', '—')}</td></tr>
+        <tr><td style="padding:8px 0;color:#64748B;font-size:13px;">Odometer</td>
+            <td style="padding:8px 0;text-align:right;font-size:13px;color:#0A192F;font-weight:600;">{booking.get('odometer_start', 0)} km</td></tr>
+        <tr><td style="padding:8px 0;color:#64748B;font-size:13px;">Started at</td>
+            <td style="padding:8px 0;text-align:right;font-size:13px;color:#0A192F;font-weight:600;">{booking.get('ride_started_at', '—')[:16]}</td></tr>
+        <tr><td style="padding:8px 0;color:#64748B;font-size:13px;">Scheduled return</td>
+            <td style="padding:8px 0;text-align:right;font-size:13px;color:#0A192F;font-weight:600;">{booking.get('dropoff_date')} {booking.get('dropoff_time')}</td></tr>
+      </table>
+      <p style="margin:18px 0 0 0;font-size:13px;line-height:1.55;color:#64748B;">Drive safe and enjoy your trip! Return the vehicle on time to avoid overtime charges.</p>
+    """
+    html = _email_layout("🚗 Ride started", body)
+    await _send_email(user["email"], f"Ride started · {booking.get('vehicle_name')}", html)
+
+
+async def _send_ride_ended_email(user: dict, booking: dict):
+    overtime_row = ""
+    if booking.get("overtime_hours", 0) > 0:
+        overtime_row = f"""<tr><td style="padding:8px 0;color:#ef4444;font-size:13px;">Overtime ({booking['overtime_hours']} hrs)</td>
+            <td style="padding:8px 0;text-align:right;font-size:13px;color:#ef4444;font-weight:600;">{_format_inr(booking.get('overtime_charge', 0))}</td></tr>"""
+    extra_row = ""
+    if booking.get("extra_charges", 0) > 0:
+        reason = booking.get('extra_charges_reason') or 'Additional charges'
+        extra_row = f"""<tr><td style="padding:8px 0;color:#ef4444;font-size:13px;">{reason}</td>
+            <td style="padding:8px 0;text-align:right;font-size:13px;color:#ef4444;font-weight:600;">{_format_inr(booking.get('extra_charges', 0))}</td></tr>"""
+    body = f"""
+      <p style="margin:0 0 12px 0;font-size:14px;line-height:1.55;color:#334155;">Hi {user.get('name', 'there').split(' ')[0]},</p>
+      <p style="margin:0 0 12px 0;font-size:14px;line-height:1.55;color:#334155;">Your ride with <b>{booking.get('vehicle_name')}</b> is complete. Here's your trip summary:</p>
+      <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:16px;border-top:1px solid #E2E8F0;">
+        <tr><td style="padding:8px 0;color:#64748B;font-size:13px;">Booking ID</td>
+            <td style="padding:8px 0;text-align:right;font-size:13px;color:#0A192F;font-weight:600;">#{booking['id'][:8]}</td></tr>
+        <tr><td style="padding:8px 0;color:#64748B;font-size:13px;">Distance driven</td>
+            <td style="padding:8px 0;text-align:right;font-size:13px;color:#0A192F;font-weight:600;">{booking.get('km_driven', 0)} km</td></tr>
+        <tr><td style="padding:8px 0;color:#64748B;font-size:13px;">Rent</td>
+            <td style="padding:8px 0;text-align:right;font-size:13px;color:#0A192F;font-weight:600;">{_format_inr(booking.get('rent_amount'))}</td></tr>
+        <tr><td style="padding:8px 0;color:#64748B;font-size:13px;">Deposit</td>
+            <td style="padding:8px 0;text-align:right;font-size:13px;color:#0A192F;font-weight:600;">{_format_inr(booking.get('deposit_amount'))}</td></tr>
+        {overtime_row}
+        {extra_row}
+      </table>
+      <p style="margin:18px 0 0 0;font-size:13px;line-height:1.55;color:#64748B;">Thank you for choosing Royal Cars! We hope you had a great experience.</p>
+    """
+    html = _email_layout("✅ Ride completed", body)
+    await _send_email(user["email"], f"Ride completed · {booking.get('vehicle_name')}", html)
 
 
 # ------------- Cloudinary upload helper -------------
@@ -773,6 +851,137 @@ async def update_booking_status(booking_id: str, payload: BookingStatusPayload, 
     return b
 
 
+# ------------- Start Ride / End Ride -------------
+@api_router.post("/admin/bookings/{booking_id}/start-ride")
+async def start_ride(booking_id: str, payload: StartRidePayload, admin: dict = Depends(require_admin)):
+    """Admin starts the ride: records pickup condition and transitions to 'active'."""
+    booking = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    if booking["status"] != "confirmed":
+        raise HTTPException(status_code=400, detail=f"Cannot start ride: booking status is '{booking['status']}', must be 'confirmed'")
+
+    now = datetime.now(timezone.utc).isoformat()
+    ride_data = {
+        "status": "active",
+        "ride_started_at": now,
+        "ride_started_by": admin["id"],
+        "odometer_start": payload.odometer_start,
+        "fuel_level_start": payload.fuel_level_start,
+        "pickup_photos": payload.photo_urls,
+        "pickup_notes": payload.notes,
+    }
+    await db.bookings.update_one({"id": booking_id}, {"$set": ride_data})
+
+    # Make the vehicle unavailable during the ride
+    await db.vehicles.update_one({"id": booking["vehicle_id"]}, {"$set": {"is_available": False}})
+
+    updated = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+
+    # Send ride started email
+    user = await db.users.find_one({"id": booking["user_id"]}, {"_id": 0})
+    if user:
+        asyncio.create_task(_send_ride_started_email(user, updated))
+
+    return updated
+
+
+@api_router.post("/admin/bookings/{booking_id}/end-ride")
+async def end_ride(booking_id: str, payload: EndRidePayload, admin: dict = Depends(require_admin)):
+    """Admin ends the ride: records return condition, calculates overtime, transitions to 'completed'."""
+    booking = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    if booking["status"] != "active":
+        raise HTTPException(status_code=400, detail=f"Cannot end ride: booking status is '{booking['status']}', must be 'active'")
+
+    if payload.odometer_end < booking.get("odometer_start", 0):
+        raise HTTPException(status_code=400, detail="End odometer reading cannot be less than start reading")
+
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    km_driven = round(payload.odometer_end - booking.get("odometer_start", 0), 1)
+
+    # Calculate overtime
+    overtime_hours = 0.0
+    overtime_charge = 0.0
+    try:
+        dropoff_dt = datetime.fromisoformat(f"{booking['dropoff_date']}T{booking['dropoff_time']}")
+        # Make timezone-naive for comparison
+        actual_return = now.replace(tzinfo=None)
+        if actual_return > dropoff_dt:
+            overtime_seconds = (actual_return - dropoff_dt).total_seconds()
+            overtime_hours = round(overtime_seconds / 3600, 1)
+            # Get vehicle overtime rate
+            vehicle = await db.vehicles.find_one({"id": booking["vehicle_id"]}, {"_id": 0})
+            rate = (vehicle or {}).get("overtime_rate_per_hour", 0) or 0
+            if rate > 0:
+                overtime_charge = round(overtime_hours * rate, 2)
+    except Exception as e:
+        logger.warning(f"Overtime calc error: {e}")
+
+    total_extra = round(overtime_charge + payload.extra_charges, 2)
+
+    ride_data = {
+        "status": "completed",
+        "ride_ended_at": now_iso,
+        "ride_ended_by": admin["id"],
+        "odometer_end": payload.odometer_end,
+        "km_driven": km_driven,
+        "fuel_level_end": payload.fuel_level_end,
+        "return_photos": payload.photo_urls,
+        "return_notes": payload.notes,
+        "overtime_hours": overtime_hours,
+        "overtime_charge": overtime_charge,
+        "extra_charges": payload.extra_charges,
+        "extra_charges_reason": payload.extra_charges_reason,
+        "total_extra_charges": total_extra,
+    }
+    await db.bookings.update_one({"id": booking_id}, {"$set": ride_data})
+
+    # Make the vehicle available again
+    await db.vehicles.update_one({"id": booking["vehicle_id"]}, {"$set": {"is_available": True}})
+
+    updated = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+
+    # Send ride ended email
+    user = await db.users.find_one({"id": booking["user_id"]}, {"_id": 0})
+    if user:
+        asyncio.create_task(_send_ride_ended_email(user, updated))
+
+    return updated
+
+
+@api_router.get("/admin/active-rides")
+async def get_active_rides(admin: dict = Depends(require_admin)):
+    """Get all currently active rides for the dashboard."""
+    rides = await db.bookings.find({"status": "active"}, {"_id": 0}).sort("ride_started_at", -1).to_list(200)
+    user_ids = list({r["user_id"] for r in rides})
+    users = await db.users.find({"id": {"$in": user_ids}}, {"_id": 0, "password_hash": 0}).to_list(200)
+    umap = {u["id"]: u for u in users}
+    for r in rides:
+        u = umap.get(r["user_id"])
+        if u:
+            r["customer_name"] = u.get("name")
+            r["customer_phone"] = u.get("phone")
+    return rides
+
+
+@api_router.get("/admin/confirmed-rides")
+async def get_confirmed_rides(admin: dict = Depends(require_admin)):
+    """Get confirmed bookings ready to start."""
+    rides = await db.bookings.find({"status": "confirmed"}, {"_id": 0}).sort("pickup_date", 1).to_list(200)
+    user_ids = list({r["user_id"] for r in rides})
+    users = await db.users.find({"id": {"$in": user_ids}}, {"_id": 0, "password_hash": 0}).to_list(200)
+    umap = {u["id"]: u for u in users}
+    for r in rides:
+        u = umap.get(r["user_id"])
+        if u:
+            r["customer_name"] = u.get("name")
+            r["customer_phone"] = u.get("phone")
+    return rides
+
+
 # ------------- Payments (Razorpay) -------------
 def _ensure_razorpay():
     if not razorpay_client:
@@ -929,6 +1138,24 @@ async def payment_verify(payload: PaymentVerifyPayload, user: dict = Depends(get
     fresh = await db.bookings.find_one({"id": payload.booking_id}, {"_id": 0})
     payment_kind = "partial" if fresh.get("balance_amount", 0) > 0 else "full"
     asyncio.create_task(send_booking_confirmed_email(user, fresh, payment_kind=payment_kind))
+    return fresh
+
+
+@api_router.post("/payments/pay-at-site")
+async def pay_at_site(payload: PayAtSitePayload, user: dict = Depends(get_current_user)):
+    booking = await db.bookings.find_one({"id": payload.booking_id}, {"_id": 0})
+    if not booking or booking["user_id"] != user["id"]:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    if booking["status"] not in {"verified", "confirmed"}:
+        raise HTTPException(status_code=400, detail="Booking not ready for payment. KYC must be approved first.")
+
+    update = {
+        "status": "confirmed",
+        "payment_type": "pay_at_site",
+    }
+    await db.bookings.update_one({"id": payload.booking_id}, {"$set": update})
+    fresh = await db.bookings.find_one({"id": payload.booking_id}, {"_id": 0})
+    asyncio.create_task(send_booking_confirmed_email(user, fresh, payment_kind="pay_at_site"))
     return fresh
 
 
@@ -1123,7 +1350,7 @@ async def root():
 # ------------- Mount & CORS -------------
 app.include_router(api_router)
 
-cors_origins = [FRONTEND_URL, "http://localhost:3000"]
+cors_origins = [FRONTEND_URL, "http://localhost:3000", "http://localhost:5173", "https://royalrentalcars.in"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
