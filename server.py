@@ -50,7 +50,7 @@ RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET") or ""
 razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)) if RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET else None
 
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
-SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "Royal Cars <onboarding@resend.dev>")
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "Royal Cars <booking@royalrentalcars.in>")
 if RESEND_API_KEY:
     resend.api_key = RESEND_API_KEY
 
