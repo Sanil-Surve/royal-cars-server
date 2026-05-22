@@ -32,6 +32,8 @@ ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
 APP_NAME = os.environ.get("APP_NAME", "royalcars")
 # FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://royalrentalcars.in")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
+COOKIE_SECURE = not FRONTEND_URL.startswith("http://")
+COOKIE_SAMESITE = "none" if COOKIE_SECURE else "lax"
 
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_MINUTES = 60 * 24  # 1 day for smooth demo
@@ -95,8 +97,8 @@ def create_refresh_token(user_id: str) -> str:
 
 
 def set_auth_cookies(response: Response, access: str, refresh: str):
-    response.set_cookie("access_token", access, httponly=True, secure=True, samesite="none", max_age=ACCESS_TOKEN_MINUTES * 60, path="/")
-    response.set_cookie("refresh_token", refresh, httponly=True, secure=True, samesite="none", max_age=REFRESH_TOKEN_DAYS * 86400, path="/")
+    response.set_cookie("access_token", access, httponly=True, secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE, max_age=ACCESS_TOKEN_MINUTES * 60, path="/")
+    response.set_cookie("refresh_token", refresh, httponly=True, secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE, max_age=REFRESH_TOKEN_DAYS * 86400, path="/")
 
 
 def serialize_user(doc: dict) -> dict:
@@ -491,7 +493,7 @@ async def refresh_token(request: Request, response: Response):
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
         access = create_access_token(user["id"], user["email"], user.get("role", "customer"))
-        response.set_cookie("access_token", access, httponly=True, secure=True, samesite="none", max_age=ACCESS_TOKEN_MINUTES * 60, path="/")
+        response.set_cookie("access_token", access, httponly=True, secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE, max_age=ACCESS_TOKEN_MINUTES * 60, path="/")
         return {"access_token": access}
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
@@ -722,12 +724,15 @@ async def kyc_verify(doc_id: str, payload: KYCVerifyPayload, admin: dict = Depen
     user_id = doc["user_id"]
     all_docs = await db.kyc_documents.find({"user_id": user_id}).to_list(50)
     types_present = {d["document_type"] for d in all_docs}
-    if payload.status == "rejected":
+    if any(d["verification_status"] == "rejected" for d in all_docs):
         new_status = "rejected"
-    elif types_present >= KYC_DOC_TYPES and all(d["verification_status"] == "approved" for d in all_docs):
-        new_status = "approved"
     else:
-        new_status = "pending"
+        required_types = {"dl_front", "dl_back", "aadhar_front", "aadhar_back"}
+        approved_types = {d["document_type"] for d in all_docs if d["verification_status"] == "approved"}
+        if required_types.issubset(approved_types):
+            new_status = "approved"
+        else:
+            new_status = "pending"
     await db.users.update_one({"id": user_id}, {"$set": {"kyc_status": new_status}})
     # If a booking is awaiting KYC and user is now approved, set to 'verified'
     if new_status == "approved":
