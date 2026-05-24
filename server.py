@@ -1346,6 +1346,20 @@ async def list_customers(admin: dict = Depends(require_admin)):
     return [serialize_user(u) | {"booking_count": u.get("booking_count", 0)} for u in users]
 
 
+@api_router.get("/admin/customers/{customer_id}")
+async def get_customer_detail(customer_id: str, admin: dict = Depends(require_admin)):
+    u = await db.users.find_one({"id": customer_id, "role": "customer"}, {"_id": 0, "password_hash": 0})
+    if not u:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    bookings = await db.bookings.find({"user_id": customer_id}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    kyc_docs = await db.kyc_documents.find({"user_id": customer_id}, {"_id": 0}).to_list(20)
+    customer = serialize_user(u)
+    customer["booking_count"] = len(bookings)
+    total_spent = sum(b.get("paid_amount", 0) or 0 for b in bookings)
+    customer["total_spent"] = total_spent
+    return {"customer": customer, "bookings": bookings, "kyc_documents": kyc_docs}
+
+
 # ------------- Health -------------
 @api_router.get("/")
 async def root():
