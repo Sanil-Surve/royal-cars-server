@@ -160,6 +160,15 @@ class LoginPayload(BaseModel):
     password: str
 
 
+class ForgotPasswordPayload(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordPayload(BaseModel):
+    token: str
+    new_password: str = Field(min_length=6)
+
+
 class LocationIn(BaseModel):
     name: str
     address: str
@@ -497,6 +506,87 @@ async def refresh_token(request: Request, response: Response):
         return {"access_token": access}
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+
+RESET_TOKEN_MINUTES = 60  # 1 hour
+
+
+@api_router.post("/auth/forgot-password")
+async def forgot_password(payload: ForgotPasswordPayload):
+    """
+    Always returns 200 to prevent email enumeration.
+    Generates a secure reset token, stores it hashed, and emails a link.
+    """
+    email = payload.email.lower()
+    user = await db.users.find_one({"email": email}, {"_id": 0})
+    if user:
+        # Invalidate any existing tokens for this user
+        await db.password_reset_tokens.delete_many({"user_id": user["id"]})
+
+        raw_token = str(uuid.uuid4())
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=RESET_TOKEN_MINUTES)
+
+        await db.password_reset_tokens.insert_one({
+            "token_hash": token_hash,
+            "user_id": user["id"],
+            "email": email,
+            "expires_at": expires_at.isoformat(),
+            "used": False,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+        reset_url = f"{FRONTEND_URL}/reset-password?token={raw_token}"
+        first_name = user.get("name", "there").split(" ")[0]
+        body_html = f"""
+          <p style="margin:0 0 12px 0;font-size:14px;line-height:1.55;color:#334155;">Hi {first_name},</p>
+          <p style="margin:0 0 20px 0;font-size:14px;line-height:1.55;color:#334155;">
+            We received a request to reset the password for your Royal Cars account.<br>
+            Click the button below to choose a new password. This link is valid for <strong>1 hour</strong>.
+          </p>
+          <p style="margin:20px 0 0 0;font-size:12px;line-height:1.55;color:#94A3B8;">
+            If you did not request a password reset, you can safely ignore this email.
+            Your password will remain unchanged.
+          </p>
+        """
+        html = _email_layout(
+            "Reset your password",
+            body_html,
+            cta={"url": reset_url, "label": "Reset Password"},
+        )
+        await _send_email(email, "Reset your Royal Cars password", html)
+
+    return {"ok": True, "message": "If an account with that email exists, a reset link has been sent."}
+
+
+@api_router.post("/auth/reset-password")
+async def reset_password(payload: ResetPasswordPayload):
+    token_hash = hashlib.sha256(payload.token.encode()).hexdigest()
+    record = await db.password_reset_tokens.find_one({"token_hash": token_hash})
+
+    if not record:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+    if record.get("used"):
+        raise HTTPException(status_code=400, detail="This reset link has already been used")
+
+    expires_at = datetime.fromisoformat(record["expires_at"])
+    if datetime.now(timezone.utc) > expires_at:
+        await db.password_reset_tokens.delete_one({"token_hash": token_hash})
+        raise HTTPException(status_code=400, detail="Reset link has expired. Please request a new one")
+
+    # Update the user's password
+    new_hash = hash_password(payload.new_password)
+    result = await db.users.update_one(
+        {"id": record["user_id"]},
+        {"$set": {"password_hash": new_hash}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Mark token as used (delete it)
+    await db.password_reset_tokens.delete_one({"token_hash": token_hash})
+
+    return {"ok": True, "message": "Password reset successfully. You can now log in with your new password."}
 
 
 # ------------- Locations -------------
