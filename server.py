@@ -230,6 +230,7 @@ class StartRidePayload(BaseModel):
     odometer_start: float = Field(..., ge=0, description="Starting odometer reading in km")
     fuel_level_start: Optional[str] = Field(None, description="Starting fuel level e.g. 'Full', '3/4', '1/2', '1/4'")
     photo_urls: List[str] = Field(default=[], description="Pickup condition photo URLs")
+    odometer_photo_url: Optional[str] = Field(None, description="Odometer photo at start")
     notes: Optional[str] = None
 
 
@@ -237,6 +238,7 @@ class EndRidePayload(BaseModel):
     odometer_end: float = Field(..., ge=0, description="Ending odometer reading in km")
     fuel_level_end: Optional[str] = Field(None, description="Ending fuel level")
     photo_urls: List[str] = Field(default=[], description="Return condition photo URLs")
+    odometer_photo_url: Optional[str] = Field(None, description="Odometer photo at end")
     notes: Optional[str] = None
     extra_charges: float = Field(default=0, ge=0, description="Manual extra charges (damage, cleaning, etc.)")
     extra_charges_reason: Optional[str] = None
@@ -966,6 +968,7 @@ async def start_ride(booking_id: str, payload: StartRidePayload, admin: dict = D
         "fuel_level_start": payload.fuel_level_start,
         "pickup_photos": payload.photo_urls,
         "pickup_notes": payload.notes,
+        "odometer_photo_start": payload.odometer_photo_url,
     }
     await db.bookings.update_one({"id": booking_id}, {"$set": ride_data})
 
@@ -1027,6 +1030,7 @@ async def end_ride(booking_id: str, payload: EndRidePayload, admin: dict = Depen
         "fuel_level_end": payload.fuel_level_end,
         "return_photos": payload.photo_urls,
         "return_notes": payload.notes,
+        "odometer_photo_end": payload.odometer_photo_url,
         "overtime_hours": overtime_hours,
         "overtime_charge": overtime_charge,
         "extra_charges": payload.extra_charges,
