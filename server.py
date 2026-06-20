@@ -188,6 +188,7 @@ class VehicleIn(BaseModel):
     description: Optional[str] = None
     seats: Optional[int] = 5
     transmission: Optional[str] = "Manual"
+    vehicle_number: Optional[str] = None  # Number plate e.g. MH12AB1234
 
 
 class BookingIn(BaseModel):
@@ -1374,13 +1375,654 @@ async def razorpay_webhook(request: Request):
             {"razorpay_order_id": order_id},
             {"$set": {"status": "failed", "webhook_failed_at": datetime.now(timezone.utc).isoformat()}},
         )
-    return {"status": "processed"}
+    return {"ok": True}
 
 
 @api_router.get("/admin/payments")
 async def all_payments(admin: dict = Depends(require_admin)):
     items = await db.payments.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
     return items
+
+
+# ------------- Discount Management System -------------
+
+TAX_RATE = 0.18  # 18% GST on discounted rental amount (configurable)
+
+# --- Pydantic models ---
+
+class CouponIn(BaseModel):
+    code: str = Field(..., min_length=3, max_length=20)
+    discount_type: Literal["percentage", "fixed"]
+    discount_value: float = Field(..., gt=0)
+    minimum_amount: float = Field(default=0, ge=0)
+    maximum_discount: float = Field(default=0, ge=0)   # 0 = no cap
+    start_date: str   # ISO date string YYYY-MM-DD
+    end_date: str
+    usage_limit: int = Field(default=0, ge=0)          # 0 = unlimited
+    is_active: bool = True
+
+
+class CouponUpdateIn(BaseModel):
+    discount_type: Optional[Literal["percentage", "fixed"]] = None
+    discount_value: Optional[float] = None
+    minimum_amount: Optional[float] = None
+    maximum_discount: Optional[float] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    usage_limit: Optional[int] = None
+    is_active: Optional[bool] = None
+
+
+class BookingCalculateIn(BaseModel):
+    vehicle_id: str
+    pickup_date: str
+    pickup_time: str
+    dropoff_date: str
+    dropoff_time: str
+
+
+class ApplyCouponIn(BaseModel):
+    vehicle_id: str
+    pickup_date: str
+    pickup_time: str
+    dropoff_date: str
+    dropoff_time: str
+    coupon_code: str
+
+
+class BookingWithDiscountIn(BaseModel):
+    vehicle_id: str
+    pickup_location_id: str
+    dropoff_location_id: str
+    pickup_date: str
+    pickup_time: str
+    dropoff_date: str
+    dropoff_time: str
+    coupon_code: Optional[str] = None
+
+
+# --- Discount service helpers ---
+
+def _compute_long_term_discount(rental_amount: float, days: int) -> tuple[float, float]:
+    """Returns (discount_amount, discount_pct). 7-14d=5%, 15-29d=10%, 30+d=15%."""
+    if days >= 30:
+        pct = 15.0
+    elif days >= 15:
+        pct = 10.0
+    elif days >= 7:
+        pct = 5.0
+    else:
+        pct = 0.0
+    return round(rental_amount * pct / 100, 2), pct
+
+
+def _compute_first_booking_discount(rental_amount: float, completed_count: int) -> tuple[float, float]:
+    """Returns (discount_amount, discount_pct). 10% for first-time customers."""
+    if completed_count == 0:
+        pct = 10.0
+        return round(rental_amount * pct / 100, 2), pct
+    return 0.0, 0.0
+
+
+def _validate_coupon(coupon: dict, rental_amount_after_discounts: float):
+    """Raises HTTPException if coupon is invalid. Raises nothing if valid."""
+    now_date = datetime.now(timezone.utc).date().isoformat()
+    if not coupon.get("is_active"):
+        raise HTTPException(status_code=400, detail="Coupon is inactive")
+    if coupon.get("end_date", "") < now_date:
+        raise HTTPException(status_code=400, detail="Coupon has expired")
+    if coupon.get("start_date", "") > now_date:
+        raise HTTPException(status_code=400, detail="Coupon is not yet valid")
+    usage_limit = coupon.get("usage_limit", 0)
+    if usage_limit > 0 and coupon.get("used_count", 0) >= usage_limit:
+        raise HTTPException(status_code=400, detail="Coupon usage limit reached")
+    min_amount = coupon.get("minimum_amount", 0)
+    if min_amount > 0 and rental_amount_after_discounts < min_amount:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Minimum booking amount of ₹{min_amount:.0f} required for this coupon"
+        )
+
+
+def _apply_coupon_discount(coupon: dict, amount_after_discounts: float) -> float:
+    """Returns the coupon discount amount (clamped to amount so total never goes negative)."""
+    if coupon["discount_type"] == "percentage":
+        disc = amount_after_discounts * coupon["discount_value"] / 100
+        max_disc = coupon.get("maximum_discount", 0)
+        if max_disc > 0:
+            disc = min(disc, max_disc)
+    else:  # fixed
+        disc = coupon["discount_value"]
+    return round(min(disc, amount_after_discounts), 2)
+
+
+async def _compute_full_pricing(
+    vehicle: dict,
+    pickup_dt: datetime,
+    dropoff_dt: datetime,
+    user_id: str,
+    coupon_doc: Optional[dict] = None,
+) -> dict:
+    """Runs the full 8-step pricing computation and returns a pricing dict."""
+    total_hours = max((dropoff_dt - pickup_dt).total_seconds() / 3600, 24)
+    rental_days = max(1, int((total_hours + 23) // 24))
+    rental_amount = round(vehicle["price_per_24hrs"] * rental_days, 2)
+    deposit_amount = vehicle["deposit_amount"]
+
+    # Step 2: long-term discount
+    long_term_disc, long_term_pct = _compute_long_term_discount(rental_amount, rental_days)
+
+    # Step 3: first booking discount
+    completed_count = await db.bookings.count_documents({"user_id": user_id, "status": "completed"})
+    first_booking_disc, first_booking_pct = _compute_first_booking_discount(rental_amount, completed_count)
+
+    # Step 4: subtotal after auto-discounts
+    subtotal = max(0.0, round(rental_amount - long_term_disc - first_booking_disc, 2))
+
+    # Step 5: coupon discount (only if coupon supplied and valid)
+    coupon_disc = 0.0
+    coupon_code_applied = None
+    if coupon_doc:
+        _validate_coupon(coupon_doc, subtotal)
+        coupon_disc = _apply_coupon_discount(coupon_doc, subtotal)
+        coupon_code_applied = coupon_doc["code"]
+
+    # Step 6-8: tax + final
+    taxable = max(0.0, round(subtotal - coupon_disc, 2))
+    tax_amount = round(taxable * TAX_RATE, 2)
+    final_amount = round(taxable + tax_amount, 2)
+    total_payable = round(final_amount + deposit_amount, 2)
+
+    return {
+        "rental_days": rental_days,
+        "rental_amount": rental_amount,
+        "long_term_discount": long_term_disc,
+        "long_term_discount_pct": long_term_pct,
+        "first_booking_discount": first_booking_disc,
+        "first_booking_discount_pct": first_booking_pct,
+        "coupon_discount": coupon_disc,
+        "applied_coupon_code": coupon_code_applied,
+        "taxable_amount": taxable,
+        "tax_amount": tax_amount,
+        "tax_rate_pct": TAX_RATE * 100,
+        "final_amount": final_amount,
+        "deposit_amount": deposit_amount,
+        "total_payable": total_payable,
+    }
+
+
+# --- Coupon CRUD endpoints ---
+
+@api_router.post("/coupons")
+async def create_coupon(payload: CouponIn, admin: dict = Depends(require_admin)):
+    code_upper = payload.code.strip().upper()
+    existing = await db.discount_coupons.find_one({"code": code_upper})
+    if existing:
+        raise HTTPException(status_code=400, detail="Coupon code already exists")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "id": str(uuid.uuid4()),
+        "code": code_upper,
+        "discount_type": payload.discount_type,
+        "discount_value": payload.discount_value,
+        "minimum_amount": payload.minimum_amount,
+        "maximum_discount": payload.maximum_discount,
+        "start_date": payload.start_date,
+        "end_date": payload.end_date,
+        "usage_limit": payload.usage_limit,
+        "used_count": 0,
+        "is_active": payload.is_active,
+        "created_by": admin["id"],
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+    await db.discount_coupons.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api_router.get("/coupons")
+async def list_coupons(admin: dict = Depends(require_admin)):
+    items = await db.discount_coupons.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    return items
+
+
+@api_router.put("/coupons/{coupon_id}")
+async def update_coupon(coupon_id: str, payload: CouponUpdateIn, admin: dict = Depends(require_admin)):
+    coupon = await db.discount_coupons.find_one({"id": coupon_id})
+    if not coupon:
+        raise HTTPException(status_code=404, detail="Coupon not found")
+    updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await db.discount_coupons.update_one({"id": coupon_id}, {"$set": updates})
+    doc = await db.discount_coupons.find_one({"id": coupon_id}, {"_id": 0})
+    return doc
+
+
+@api_router.delete("/coupons/{coupon_id}")
+async def delete_coupon(coupon_id: str, admin: dict = Depends(require_admin)):
+    result = await db.discount_coupons.delete_one({"id": coupon_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Coupon not found")
+    return {"ok": True}
+
+
+@api_router.patch("/coupons/{coupon_id}/toggle")
+async def toggle_coupon(coupon_id: str, admin: dict = Depends(require_admin)):
+    coupon = await db.discount_coupons.find_one({"id": coupon_id})
+    if not coupon:
+        raise HTTPException(status_code=404, detail="Coupon not found")
+    new_status = not coupon.get("is_active", False)
+    await db.discount_coupons.update_one(
+        {"id": coupon_id},
+        {"$set": {"is_active": new_status, "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    doc = await db.discount_coupons.find_one({"id": coupon_id}, {"_id": 0})
+    return doc
+
+
+# --- Booking calculation endpoints ---
+
+@api_router.post("/bookings/calculate")
+async def calculate_booking(payload: BookingCalculateIn, user: dict = Depends(get_current_user)):
+    vehicle = await db.vehicles.find_one({"id": payload.vehicle_id}, {"_id": 0})
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    try:
+        pickup_dt = datetime.fromisoformat(f"{payload.pickup_date}T{payload.pickup_time}")
+        dropoff_dt = datetime.fromisoformat(f"{payload.dropoff_date}T{payload.dropoff_time}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date/time format")
+    if dropoff_dt <= pickup_dt:
+        raise HTTPException(status_code=400, detail="Dropoff must be after pickup")
+    pricing = await _compute_full_pricing(vehicle, pickup_dt, dropoff_dt, user["id"])
+    return pricing
+
+
+@api_router.post("/bookings/apply-coupon")
+async def apply_coupon_to_booking(payload: ApplyCouponIn, user: dict = Depends(get_current_user)):
+    vehicle = await db.vehicles.find_one({"id": payload.vehicle_id}, {"_id": 0})
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    try:
+        pickup_dt = datetime.fromisoformat(f"{payload.pickup_date}T{payload.pickup_time}")
+        dropoff_dt = datetime.fromisoformat(f"{payload.dropoff_date}T{payload.dropoff_time}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date/time format")
+    if dropoff_dt <= pickup_dt:
+        raise HTTPException(status_code=400, detail="Dropoff must be after pickup")
+    coupon = await db.discount_coupons.find_one(
+        {"code": payload.coupon_code.strip().upper()}, {"_id": 0}
+    )
+    if not coupon:
+        raise HTTPException(status_code=404, detail="Coupon code not found")
+    pricing = await _compute_full_pricing(vehicle, pickup_dt, dropoff_dt, user["id"], coupon_doc=coupon)
+    return pricing
+
+
+# --- Extended booking creation (with discounts) ---
+
+@api_router.post("/bookings/create")
+async def create_booking_with_discount(payload: BookingWithDiscountIn, user: dict = Depends(get_current_user)):
+    vehicle = await db.vehicles.find_one({"id": payload.vehicle_id}, {"_id": 0})
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    _validate_business_hours(payload.pickup_time)
+    _validate_business_hours(payload.dropoff_time)
+    try:
+        pickup_dt = datetime.fromisoformat(f"{payload.pickup_date}T{payload.pickup_time}")
+        dropoff_dt = datetime.fromisoformat(f"{payload.dropoff_date}T{payload.dropoff_time}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date/time")
+    if dropoff_dt <= pickup_dt:
+        raise HTTPException(status_code=400, detail="Dropoff must be after pickup")
+
+    # Resolve coupon
+    coupon_doc = None
+    if payload.coupon_code:
+        coupon_doc = await db.discount_coupons.find_one(
+            {"code": payload.coupon_code.strip().upper()}, {"_id": 0}
+        )
+        if not coupon_doc:
+            raise HTTPException(status_code=404, detail="Coupon code not found")
+
+    pricing = await _compute_full_pricing(vehicle, pickup_dt, dropoff_dt, user["id"], coupon_doc=coupon_doc)
+
+    status = "verified" if user.get("kyc_status") == "approved" else "pending_kyc"
+    booking_id = str(uuid.uuid4())
+    doc = {
+        "id": booking_id,
+        "user_id": user["id"],
+        "vehicle_id": payload.vehicle_id,
+        "vehicle_name": vehicle["name"],
+        "vehicle_image": (vehicle.get("image_urls") or [None])[0],
+        "pickup_location_id": payload.pickup_location_id,
+        "dropoff_location_id": payload.dropoff_location_id,
+        "pickup_date": payload.pickup_date,
+        "pickup_time": payload.pickup_time,
+        "dropoff_date": payload.dropoff_date,
+        "dropoff_time": payload.dropoff_time,
+        # Pricing breakdown
+        "rental_days": pricing["rental_days"],
+        "rent_amount": pricing["rental_amount"],
+        "long_term_discount_amount": pricing["long_term_discount"],
+        "long_term_discount_pct": pricing["long_term_discount_pct"],
+        "first_booking_discount_amount": pricing["first_booking_discount"],
+        "first_booking_discount_pct": pricing["first_booking_discount_pct"],
+        "applied_coupon_code": pricing["applied_coupon_code"],
+        "coupon_discount_amount": pricing["coupon_discount"],
+        "tax_amount": pricing["tax_amount"],
+        "tax_rate_pct": pricing["tax_rate_pct"],
+        "rental_amount_before_tax": pricing["taxable_amount"],
+        "final_amount": pricing["final_amount"],
+        "deposit_amount": pricing["deposit_amount"],
+        # total_amount = final + deposit (for payment system compatibility)
+        "total_amount": pricing["total_payable"],
+        "status": status,
+        "payment_type": None,
+        "paid_amount": 0.0,
+        "balance_amount": pricing["total_payable"],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.bookings.insert_one(doc)
+    doc.pop("_id", None)
+
+    # Increment coupon usage counter
+    if coupon_doc:
+        await db.discount_coupons.update_one(
+            {"id": coupon_doc["id"]},
+            {"$inc": {"used_count": 1}}
+        )
+
+    asyncio.create_task(send_booking_received_email(user, doc))
+    return doc
+
+
+# --- Admin discount report ---
+
+@api_router.get("/admin/discount-report")
+async def discount_report(admin: dict = Depends(require_admin)):
+    pipeline = [
+        {"$match": {"status": {"$nin": ["cancelled"]}}},
+        {"$group": {
+            "_id": None,
+            "total_bookings": {"$sum": 1},
+            "total_long_term_discount": {"$sum": {"$ifNull": ["$long_term_discount_amount", 0]}},
+            "total_first_booking_discount": {"$sum": {"$ifNull": ["$first_booking_discount_amount", 0]}},
+            "total_coupon_discount": {"$sum": {"$ifNull": ["$coupon_discount_amount", 0]}},
+            "total_tax_collected": {"$sum": {"$ifNull": ["$tax_amount", 0]}},
+            "bookings_with_long_term": {"$sum": {"$cond": [{"$gt": ["$long_term_discount_amount", 0]}, 1, 0]}},
+            "bookings_with_first_booking": {"$sum": {"$cond": [{"$gt": ["$first_booking_discount_amount", 0]}, 1, 0]}},
+            "bookings_with_coupon": {"$sum": {"$cond": [{"$gt": ["$coupon_discount_amount", 0]}, 1, 0]}},
+        }},
+    ]
+    report = {"total_bookings": 0, "total_long_term_discount": 0, "total_first_booking_discount": 0,
+              "total_coupon_discount": 0, "total_tax_collected": 0,
+              "bookings_with_long_term": 0, "bookings_with_first_booking": 0, "bookings_with_coupon": 0}
+    async for r in db.bookings.aggregate(pipeline):
+        report.update({k: round(v, 2) for k, v in r.items() if k != "_id"})
+
+    # Top coupons by usage
+    top_coupons = await db.discount_coupons.find({}, {"_id": 0}).sort("used_count", -1).to_list(10)
+    report["top_coupons"] = top_coupons
+    report["total_discount_given"] = round(
+        report["total_long_term_discount"] + report["total_first_booking_discount"] + report["total_coupon_discount"], 2
+    )
+    return report
+
+
+
+# ------------- Vehicle Analytics -------------
+
+@api_router.get("/admin/vehicles/search")
+async def search_vehicles_by_plate(q: str = "", admin: dict = Depends(require_admin)):
+    """
+    Case-insensitive partial match on vehicle_number (number plate).
+    Returns up to 20 matching vehicles with their details.
+    """
+    if not q.strip():
+        return []
+    pattern = q.strip().upper()
+    # Use regex for partial, case-insensitive matching
+    cursor = db.vehicles.find(
+        {"vehicle_number": {"$regex": pattern, "$options": "i"}},
+        {"_id": 0}
+    ).limit(20)
+    return await cursor.to_list(20)
+
+
+@api_router.get("/admin/analytics/monthly")
+async def monthly_analytics(
+    vehicle_id: str,
+    month: int,
+    year: int,
+    admin: dict = Depends(require_admin),
+):
+    """
+    Monthly booking analytics for a specific vehicle.
+    Returns totals for bookings, revenue, rental days, unique customers, and status breakdown.
+    """
+    # Validate inputs
+    if not (1 <= month <= 12):
+        raise HTTPException(status_code=400, detail="Month must be between 1 and 12")
+    if year < 2000 or year > 2100:
+        raise HTTPException(status_code=400, detail="Invalid year")
+
+    vehicle = await db.vehicles.find_one({"id": vehicle_id}, {"_id": 0})
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+
+    # Build month prefix for ISO date string matching e.g. "2026-06-"
+    month_prefix = f"{year}-{month:02d}-"
+
+    # Main aggregation pipeline
+    pipeline = [
+        {
+            "$match": {
+                "vehicle_id": vehicle_id,
+                "pickup_date": {"$regex": f"^{month_prefix}"},
+            }
+        },
+        {
+            "$addFields": {
+                # Compute rental days from pickup_date and dropoff_date strings
+                "pickup_dt": {"$dateFromString": {"dateString": "$pickup_date"}},
+                "dropoff_dt": {"$dateFromString": {"dateString": "$dropoff_date"}},
+            }
+        },
+        {
+            "$addFields": {
+                "rental_days": {
+                    "$max": [
+                        1,
+                        {
+                            "$ceil": {
+                                "$divide": [
+                                    {"$subtract": ["$dropoff_dt", "$pickup_dt"]},
+                                    86400000,  # ms per day
+                                ]
+                            }
+                        },
+                    ]
+                }
+            }
+        },
+        {
+            "$facet": {
+                "totals": [
+                    {
+                        "$group": {
+                            "_id": None,
+                            "totalBookings": {"$sum": 1},
+                            "totalRevenue": {"$sum": "$rent_amount"},
+                            "totalRentalDays": {"$sum": "$rental_days"},
+                            "uniqueCustomers": {"$addToSet": "$user_id"},
+                        }
+                    }
+                ],
+                "statusBreakdown": [
+                    {
+                        "$group": {
+                            "_id": "$status",
+                            "count": {"$sum": 1},
+                        }
+                    }
+                ],
+            }
+        },
+    ]
+
+    result = await db.bookings.aggregate(pipeline).to_list(1)
+
+    if not result:
+        totals = {}
+        status_breakdown = []
+    else:
+        totals = result[0]["totals"][0] if result[0]["totals"] else {}
+        status_breakdown = result[0]["statusBreakdown"]
+
+    # Build status summary map
+    status_map = {s["_id"]: s["count"] for s in status_breakdown}
+
+    return {
+        "vehicleId": vehicle_id,
+        "vehicleName": vehicle.get("name"),
+        "vehicleNumber": vehicle.get("vehicle_number"),
+        "month": month,
+        "year": year,
+        "totalBookings": totals.get("totalBookings", 0),
+        "totalRevenue": round(totals.get("totalRevenue", 0), 2),
+        "totalRentalDays": int(totals.get("totalRentalDays", 0)),
+        "uniqueCustomers": len(totals.get("uniqueCustomers", [])),
+        "statusSummary": {
+            "completed": status_map.get("completed", 0),
+            "active": status_map.get("active", 0),
+            "confirmed": status_map.get("confirmed", 0),
+            "cancelled": status_map.get("cancelled", 0),
+            "pending_kyc": status_map.get("pending_kyc", 0),
+            "verified": status_map.get("verified", 0),
+        },
+    }
+
+
+@api_router.get("/admin/analytics/yearly")
+async def yearly_analytics(
+    vehicle_id: str,
+    year: int,
+    admin: dict = Depends(require_admin),
+):
+    """
+    Yearly booking analytics for a specific vehicle.
+    Returns totals, monthly breakdown, and most-active month.
+    """
+    if year < 2000 or year > 2100:
+        raise HTTPException(status_code=400, detail="Invalid year")
+
+    vehicle = await db.vehicles.find_one({"id": vehicle_id}, {"_id": 0})
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+
+    year_prefix = str(year)
+
+    MONTH_NAMES = [
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December",
+    ]
+
+    pipeline = [
+        {
+            "$match": {
+                "vehicle_id": vehicle_id,
+                "pickup_date": {"$regex": f"^{year_prefix}-"},
+            }
+        },
+        {
+            "$addFields": {
+                "pickup_dt": {"$dateFromString": {"dateString": "$pickup_date"}},
+                "dropoff_dt": {"$dateFromString": {"dateString": "$dropoff_date"}},
+            }
+        },
+        {
+            "$addFields": {
+                "rental_days": {
+                    "$max": [
+                        1,
+                        {
+                            "$ceil": {
+                                "$divide": [
+                                    {"$subtract": ["$dropoff_dt", "$pickup_dt"]},
+                                    86400000,
+                                ]
+                            }
+                        },
+                    ]
+                },
+                "month_num": {"$month": "$pickup_dt"},
+            }
+        },
+        {
+            "$facet": {
+                "totals": [
+                    {
+                        "$group": {
+                            "_id": None,
+                            "totalBookings": {"$sum": 1},
+                            "totalRevenue": {"$sum": "$rent_amount"},
+                            "totalRentalDays": {"$sum": "$rental_days"},
+                        }
+                    }
+                ],
+                "monthly": [
+                    {
+                        "$group": {
+                            "_id": "$month_num",
+                            "bookings": {"$sum": 1},
+                            "revenue": {"$sum": "$rent_amount"},
+                            "rentalDays": {"$sum": "$rental_days"},
+                        }
+                    },
+                    {"$sort": {"_id": 1}},
+                ],
+            }
+        },
+    ]
+
+    result = await db.bookings.aggregate(pipeline).to_list(1)
+
+    if not result:
+        totals_raw = {}
+        monthly_raw = []
+    else:
+        totals_raw = result[0]["totals"][0] if result[0]["totals"] else {}
+        monthly_raw = result[0]["monthly"]
+
+    # Build full 12-month array (fill gaps with zeros)
+    monthly_map = {r["_id"]: r for r in monthly_raw}
+    monthly_bookings = []
+    for i in range(1, 13):
+        entry = monthly_map.get(i, {})
+        monthly_bookings.append({
+            "month": MONTH_NAMES[i - 1],
+            "monthNum": i,
+            "bookings": entry.get("bookings", 0),
+            "revenue": round(entry.get("revenue", 0), 2),
+            "rentalDays": int(entry.get("rentalDays", 0)),
+        })
+
+    # Most active month by booking count
+    most_active = max(monthly_bookings, key=lambda x: x["bookings"], default=None)
+
+    return {
+        "vehicleId": vehicle_id,
+        "vehicleName": vehicle.get("name"),
+        "vehicleNumber": vehicle.get("vehicle_number"),
+        "year": year,
+        "totalBookings": totals_raw.get("totalBookings", 0),
+        "totalRevenue": round(totals_raw.get("totalRevenue", 0), 2),
+        "totalRentalDays": int(totals_raw.get("totalRentalDays", 0)),
+        "mostActiveMonth": most_active["month"] if most_active and most_active["bookings"] > 0 else None,
+        "monthlyBookings": monthly_bookings,
+    }
 
 
 # ------------- Admin dashboard metrics + customers -------------
@@ -1553,6 +2195,14 @@ async def on_startup():
     await db.bookings.create_index("status")
     await db.kyc_documents.create_index("user_id")
     await db.vehicles.create_index("location_id")
+    # Discount indexes
+    await db.discount_coupons.create_index("code", unique=True)
+    await db.discount_coupons.create_index("is_active")
+    # Analytics indexes
+    await db.vehicles.create_index("vehicle_number")
+    await db.bookings.create_index("vehicle_id")
+    await db.bookings.create_index("pickup_date")
+    await db.bookings.create_index("created_at")
     # Seed
     await seed_admin()
     await seed_locations()
