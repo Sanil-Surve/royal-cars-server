@@ -13,7 +13,7 @@ import bcrypt
 import jwt
 import cloudinary
 import cloudinary.uploader
-import razorpay
+import httpx
 import resend
 import asyncio
 import hmac
@@ -46,10 +46,9 @@ cloudinary.config(
     secure=True,
 )
 
-RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID")
-RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET")
-RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET") or ""
-razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)) if RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET else None
+PAYU_MERCHANT_KEY = os.environ.get("PAYU_MERCHANT_KEY", "")
+PAYU_MERCHANT_SALT = os.environ.get("PAYU_MERCHANT_SALT", "")
+PAYU_BASE_URL = os.environ.get("PAYU_BASE_URL", "https://secure.payu.in")
 
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "Royal Cars <booking@royalrentalcars.in>")
@@ -217,9 +216,7 @@ class PayAtSitePayload(BaseModel):
 
 class PaymentVerifyPayload(BaseModel):
     booking_id: str
-    razorpay_order_id: str
-    razorpay_payment_id: str
-    razorpay_signature: str
+    txnid: str
 
 
 class BookingStatusPayload(BaseModel):
@@ -1082,35 +1079,46 @@ async def get_confirmed_rides(admin: dict = Depends(require_admin)):
     return rides
 
 
-# ------------- Payments (Razorpay) -------------
-def _ensure_razorpay():
-    if not razorpay_client:
-        raise HTTPException(status_code=500, detail="Razorpay not configured on server")
+# ------------- Payments (PayU Seamless UPI) -------------
+
+def _ensure_payu():
+    if not PAYU_MERCHANT_KEY or not PAYU_MERCHANT_SALT:
+        raise HTTPException(status_code=500, detail="PayU not configured on server")
 
 
-async def _get_or_create_razorpay_customer(user: dict) -> Optional[str]:
-    existing = user.get("razorpay_customer_id")
-    if existing:
-        return existing
-    try:
-        cust = razorpay_client.customer.create({
-            "name": user.get("name") or "Customer",
-            "email": user["email"],
-            "contact": user.get("phone") or "",
-            "fail_existing": "0",
-        })
-        cid = cust.get("id")
-        if cid:
-            await db.users.update_one({"id": user["id"]}, {"$set": {"razorpay_customer_id": cid}})
-        return cid
-    except Exception as e:
-        logger.warning(f"Razorpay customer create failed: {e}")
-        return None
+def _payu_hash(data_string: str) -> str:
+    """Generate SHA-512 hash for PayU."""
+    return hashlib.sha512(data_string.encode()).hexdigest()
+
+
+def _build_payu_forward_hash(
+    txnid: str,
+    amount: str,
+    productinfo: str,
+    firstname: str,
+    email: str,
+) -> str:
+    """
+    Forward hash formula:
+    sha512(key|txnid|amount|productinfo|firstname|email|udf1|udf2|udf3|udf4|udf5||||||SALT)
+    """
+    data = f"{PAYU_MERCHANT_KEY}|{txnid}|{amount}|{productinfo}|{firstname}|{email}|||||||||||{PAYU_MERCHANT_SALT}"
+    return _payu_hash(data)
+
+
+def _build_payu_verify_hash(txnid: str) -> str:
+    """
+    Verify payment hash formula:
+    sha512(key|command|var1|SALT)
+    """
+    data = f"{PAYU_MERCHANT_KEY}|verify_payment|{txnid}|{PAYU_MERCHANT_SALT}"
+    return _payu_hash(data)
 
 
 @api_router.post("/payments/init")
 async def payment_init(payload: PaymentInitPayload, user: dict = Depends(get_current_user)):
-    _ensure_razorpay()
+    """Initiates a PayU UPI payment. Returns intentURIData for QR code display."""
+    _ensure_payu()
     booking = await db.bookings.find_one({"id": payload.booking_id}, {"_id": 0})
     if not booking or booking["user_id"] != user["id"]:
         raise HTTPException(status_code=404, detail="Booking not found")
@@ -1118,7 +1126,7 @@ async def payment_init(payload: PaymentInitPayload, user: dict = Depends(get_cur
         raise HTTPException(status_code=400, detail="Booking not ready for payment. KYC must be approved first.")
 
     if payload.payment_type == "full":
-        amount = booking["total_amount"] - booking.get("paid_amount", 0)
+        amount = round(booking["total_amount"] - booking.get("paid_amount", 0), 2)
         record_type = "full"
     elif payload.payment_type == "partial":
         if booking.get("paid_amount", 0) > 0:
@@ -1131,93 +1139,169 @@ async def payment_init(payload: PaymentInitPayload, user: dict = Depends(get_cur
             raise HTTPException(status_code=400, detail="No balance due")
         record_type = "balance"
 
-    amount_paise = int(round(amount * 100))
-    customer_id = await _get_or_create_razorpay_customer(user)
+    # Generate unique txnid
+    is_mock = os.environ.get("MOCK_PAYMENTS") == "true" or PAYU_MERCHANT_KEY == "mock" or payload.booking_id.startswith("mock_")
+    txnid = f"RC_TEST_{str(uuid.uuid4()).replace('-', '')[:10].upper()}" if is_mock else f"RC{str(uuid.uuid4()).replace('-', '')[:18].upper()}"
+    amount_str = f"{amount:.2f}"
 
-    receipt = f"bk_{payload.booking_id[:30]}"
-    order_opts = {
-        "amount": amount_paise,
-        "currency": "INR",
-        "receipt": receipt,
-        "payment_capture": 1,
-        "notes": {
-            "booking_id": booking["id"],
-            "user_id": user["id"],
-            "payment_type": record_type,
-        },
-    }
-    try:
-        order = razorpay_client.order.create(order_opts)
-    except Exception as e:
-        logger.error(f"Razorpay order create failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Payment init failed: {e}")
+    if is_mock:
+        intent_uri = f"upi://pay?pa=royalrentalcars@payu&pn=Royal%20Cars&am={amount_str}&tr={txnid}"
+    else:
+        productinfo = f"Booking#{booking['id'][:8]}"
+        firstname = (user.get("name") or "Customer").split()[0]
+        email = user["email"]
+        phone = user.get("phone") or "9999999999"
+        surl = f"{FRONTEND_URL}/payment/success"
+        furl = f"{FRONTEND_URL}/payment/failure"
 
+        forward_hash = _build_payu_forward_hash(txnid, amount_str, productinfo, firstname, email)
+
+        payu_payload = {
+            "key": PAYU_MERCHANT_KEY,
+            "txnid": txnid,
+            "amount": amount_str,
+            "productinfo": productinfo,
+            "firstname": firstname,
+            "email": email,
+            "phone": phone,
+            "surl": surl,
+            "furl": furl,
+            "pg": "UPI",
+            "bankcode": "INTENT",
+            "txn_s2s_flow": "4",
+            "hash": forward_hash,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(f"{PAYU_BASE_URL}/_payment", data=payu_payload)
+                resp.raise_for_status()
+                payu_resp = resp.json()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"PayU _payment HTTP error: {e.response.status_code} {e.response.text}")
+            raise HTTPException(status_code=502, detail=f"PayU gateway error: {e.response.status_code}")
+        except Exception as e:
+            logger.error(f"PayU _payment failed: {e}")
+            raise HTTPException(status_code=502, detail=f"PayU gateway error: {str(e)[:200]}")
+
+        logger.info(f"PayU _payment raw response: {payu_resp}")
+
+        result_val = payu_resp.get("result")
+        result_dict = result_val if isinstance(result_val, dict) else {}
+
+        data_val = payu_resp.get("data")
+        data_dict = data_val if isinstance(data_val, dict) else {}
+
+        intent_uri = (
+            payu_resp.get("intentURIData")
+            or result_dict.get("intentURIData")
+            or data_dict.get("intentURIData")
+            or ""
+        )
+        if not intent_uri:
+            logger.error(f"PayU response missing intentURIData. Check credentials/environment. Response: {payu_resp}")
+            raise HTTPException(status_code=502, detail="PayU did not return UPI intent data. Check credentials/environment.")
+
+        if intent_uri and not intent_uri.startswith("upi://"):
+            intent_uri = f"upi://pay?{intent_uri}"
+
+    # Persist pending payment record
     await db.payments.insert_one({
         "id": str(uuid.uuid4()),
         "booking_id": payload.booking_id,
         "amount": amount,
         "payment_type": record_type,
-        "razorpay_order_id": order["id"],
-        "razorpay_payment_id": None,
-        "razorpay_customer_id": customer_id,
+        "payu_txnid": txnid,
+        "payu_mihpayid": None,
         "status": "pending",
-        "is_balance_charge": record_type == "balance",
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
 
     return {
-        "order_id": order["id"],
-        "amount": amount_paise,
-        "currency": "INR",
-        "key": RAZORPAY_KEY_ID,
-        "customer_id": customer_id,
-        "save_token": payload.payment_type == "partial",
-        "prefill": {
-            "name": user.get("name") or "",
-            "email": user["email"],
-            "contact": user.get("phone") or "",
-        },
-        "notes": order_opts["notes"],
+        "txnid": txnid,
+        "amount": amount,
+        "intentURIData": intent_uri,
+        "payment_type": record_type,
+        "is_sandbox": "test" in PAYU_BASE_URL or is_mock,
     }
 
 
 @api_router.post("/payments/verify")
 async def payment_verify(payload: PaymentVerifyPayload, user: dict = Depends(get_current_user)):
-    _ensure_razorpay()
+    """Polls PayU to verify if a transaction has been paid. Safe to call repeatedly."""
+    _ensure_payu()
     booking = await db.bookings.find_one({"id": payload.booking_id}, {"_id": 0})
     if not booking or booking["user_id"] != user["id"]:
         raise HTTPException(status_code=404, detail="Booking not found")
 
-    try:
-        razorpay_client.utility.verify_payment_signature({
-            "razorpay_order_id": payload.razorpay_order_id,
-            "razorpay_payment_id": payload.razorpay_payment_id,
-            "razorpay_signature": payload.razorpay_signature,
-        })
-    except razorpay.errors.SignatureVerificationError:
-        raise HTTPException(status_code=400, detail="Payment signature verification failed")
+    # Check if already processed (idempotent)
+    already = await db.payments.find_one({"payu_txnid": payload.txnid, "status": "success"})
+    if already:
+        fresh = await db.bookings.find_one({"id": payload.booking_id}, {"_id": 0})
+        return fresh
 
-    # Fetch payment to capture token_id (saved card) if any
-    token_id = None
-    try:
-        p = razorpay_client.payment.fetch(payload.razorpay_payment_id)
-        token_id = p.get("token_id")
-    except Exception as e:
-        logger.warning(f"Payment fetch failed: {e}")
+    is_mock = os.environ.get("MOCK_PAYMENTS") == "true" or PAYU_MERCHANT_KEY == "mock" or payload.txnid.startswith("RC_TEST_")
 
+    if is_mock:
+        status = "success"
+        mihpayid = f"mih_mock_{str(uuid.uuid4()).replace('-', '')[:10].upper()}"
+    else:
+        verify_hash = _build_payu_verify_hash(payload.txnid)
+        verify_payload = {
+            "key": PAYU_MERCHANT_KEY,
+            "command": "verify_payment",
+            "var1": payload.txnid,
+            "hash": verify_hash,
+        }
+
+        verify_url = "https://test.payu.in/merchant/postservice?form=2" if "test" in PAYU_BASE_URL else "https://info.payu.in/merchant/postservice?form=2"
+
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.post(
+                    verify_url,
+                    data=verify_payload,
+                )
+                resp.raise_for_status()
+                verify_resp = resp.json()
+        except Exception as e:
+            logger.error(f"PayU verify_payment failed: {e}")
+            raise HTTPException(status_code=502, detail=f"Payment verification error: {str(e)[:200]}")
+
+        # Parse PayU verify response
+        transaction_details = (
+            verify_resp.get("transaction_details", {})
+            or verify_resp.get("result", {})
+        )
+        txn = None
+        if isinstance(transaction_details, dict):
+            txn = transaction_details.get(payload.txnid) or next(iter(transaction_details.values()), None)
+
+        if not txn:
+            raise HTTPException(status_code=400, detail="Transaction not found in PayU response")
+
+        status = (txn.get("status") or "").lower()
+        mihpayid = txn.get("mihpayid") or txn.get("payuMoneyId") or ""
+
+        if status != "success":
+            raise HTTPException(
+                status_code=402,
+                detail=f"Payment not yet successful. Status: {status}",
+            )
+
+
+    # Update payment record
     pending = await db.payments.find_one(
-        {"razorpay_order_id": payload.razorpay_order_id, "status": "pending"},
+        {"payu_txnid": payload.txnid, "status": "pending"},
         sort=[("created_at", -1)],
     )
     if not pending:
-        raise HTTPException(status_code=400, detail="Order not found or already processed")
+        raise HTTPException(status_code=400, detail="Payment record not found or already processed")
 
     await db.payments.update_one(
         {"id": pending["id"]},
         {"$set": {
-            "razorpay_payment_id": payload.razorpay_payment_id,
-            "razorpay_signature": payload.razorpay_signature,
-            "razorpay_token_id": token_id,
+            "payu_mihpayid": mihpayid,
             "status": "success",
             "paid_at": datetime.now(timezone.utc).isoformat(),
         }},
@@ -1231,14 +1315,56 @@ async def payment_verify(payload: PaymentVerifyPayload, user: dict = Depends(get
         "balance_amount": max(balance, 0),
         "payment_type": "full" if abs(balance) < 0.01 else "partial",
     }
-    if token_id and pending.get("payment_type") == "partial_advance":
-        update["razorpay_token_id"] = token_id
-        update["razorpay_customer_id"] = pending.get("razorpay_customer_id")
     await db.bookings.update_one({"id": payload.booking_id}, {"$set": update})
     fresh = await db.bookings.find_one({"id": payload.booking_id}, {"_id": 0})
     payment_kind = "partial" if fresh.get("balance_amount", 0) > 0 else "full"
     asyncio.create_task(send_booking_confirmed_email(user, fresh, payment_kind=payment_kind))
     return fresh
+
+@api_router.post("/payments/simulate-success")
+async def payments_simulate_success(payload: PaymentVerifyPayload, user: dict = Depends(get_current_user)):
+    """Only active in sandbox/test mode: forces the pending transaction to success."""
+    _ensure_payu()
+    if "test" not in PAYU_BASE_URL and PAYU_MERCHANT_KEY != "mock":
+        raise HTTPException(status_code=400, detail="Simulation not allowed in production environment")
+
+    booking = await db.bookings.find_one({"id": payload.booking_id}, {"_id": 0})
+    if not booking or booking["user_id"] != user["id"]:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    pending = await db.payments.find_one({"payu_txnid": payload.txnid, "status": "pending"})
+    if not pending:
+        # Check if already success (idempotence for button clicks)
+        already = await db.payments.find_one({"payu_txnid": payload.txnid, "status": "success"})
+        if already:
+            return {"ok": True}
+        raise HTTPException(status_code=404, detail="Pending payment record not found")
+
+    # Mark payment as success in DB
+    await db.payments.update_one(
+        {"id": pending["id"]},
+        {"$set": {
+            "payu_mihpayid": f"mih_mock_{str(uuid.uuid4()).replace('-', '')[:10].upper()}",
+            "status": "success",
+            "paid_at": datetime.now(timezone.utc).isoformat(),
+        }},
+    )
+
+    # Confirm booking
+    paid_amount = round(booking.get("paid_amount", 0) + pending["amount"], 2)
+    balance = round(booking["total_amount"] - paid_amount, 2)
+    update = {
+        "status": "confirmed",
+        "paid_amount": paid_amount,
+        "balance_amount": max(balance, 0),
+        "payment_type": "full" if abs(balance) < 0.01 else "partial",
+    }
+    await db.bookings.update_one({"id": payload.booking_id}, {"$set": update})
+    fresh = await db.bookings.find_one({"id": payload.booking_id}, {"_id": 0})
+    payment_kind = "partial" if fresh.get("balance_amount", 0) > 0 else "full"
+    asyncio.create_task(send_booking_confirmed_email(user, fresh, payment_kind=payment_kind))
+    return {"ok": True}
+
 
 
 @api_router.post("/payments/pay-at-site")
@@ -1259,69 +1385,78 @@ async def pay_at_site(payload: PayAtSitePayload, user: dict = Depends(get_curren
     return fresh
 
 
-@api_router.post("/admin/bookings/{booking_id}/charge-balance")
-async def admin_charge_balance(booking_id: str, admin: dict = Depends(require_admin)):
-    _ensure_razorpay()
-    booking = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
-    if not booking:
-        raise HTTPException(status_code=404, detail="Booking not found")
-    balance = booking.get("balance_amount", 0)
-    if balance <= 0:
-        raise HTTPException(status_code=400, detail="No balance due")
-    customer_id = booking.get("razorpay_customer_id")
-    token_id = booking.get("razorpay_token_id")
-    if not customer_id or not token_id:
-        raise HTTPException(status_code=400, detail="No saved payment method on this booking. Collect at pickup manually or mark paid.")
+@api_router.post("/payments/webhook")
+async def payu_webhook(request: Request):
+    """PayU S2S callback — validates reverse hash and marks payment success."""
+    form = await request.form()
+    data = dict(form)
 
-    user = await db.users.find_one({"id": booking["user_id"]}, {"_id": 0, "password_hash": 0})
-    balance_paise = int(round(balance * 100))
-    try:
-        order = razorpay_client.order.create({
-            "amount": balance_paise,
-            "currency": "INR",
-            "receipt": f"bal_{booking_id[:30]}",
-            "payment_capture": 1,
-            "notes": {"booking_id": booking_id, "type": "balance_charge"},
-        })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Order create failed: {e}")
+    status = data.get("status", "").lower()
+    txnid = data.get("txnid", "")
+    received_hash = data.get("hash", "")
 
-    try:
-        result = razorpay_client.payment.create_recurring_payment({
-            "email": user["email"],
-            "contact": user.get("phone") or "",
-            "amount": balance_paise,
-            "currency": "INR",
-            "order_id": order["id"],
-            "customer_id": customer_id,
-            "token": token_id,
-            "recurring": "1",
-            "description": f"Balance for booking {booking_id[:8]}",
-        })
-    except Exception as e:
-        logger.error(f"Recurring payment failed: {e}")
-        raise HTTPException(status_code=502, detail=f"Auto-charge failed: {str(e)[:200]}. Customer can pay at pickup.")
+    if not txnid or not received_hash:
+        return {"status": "ignored"}
 
-    payment_id = result.get("razorpay_payment_id") or result.get("id")
-    await db.payments.insert_one({
-        "id": str(uuid.uuid4()),
-        "booking_id": booking_id,
-        "amount": balance,
-        "payment_type": "balance",
-        "razorpay_order_id": order["id"],
-        "razorpay_payment_id": payment_id,
-        "razorpay_customer_id": customer_id,
-        "status": "success",
-        "is_balance_charge": True,
-        "paid_at": datetime.now(timezone.utc).isoformat(),
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    })
-    await db.bookings.update_one({"id": booking_id}, {"$set": {
-        "paid_amount": booking["total_amount"],
-        "balance_amount": 0,
-        "payment_type": "full",
-    }})
-    return {"ok": True, "payment_id": payment_id}
+    # Reverse hash verification:
+    # sha512(SALT|status|udf5|udf4|udf3|udf2|udf1|email|firstname|productinfo|amount|txnid|key)
+    reverse_str = "|".join([
+        PAYU_MERCHANT_SALT,
+        data.get("status", ""),
+        data.get("udf5", ""),
+        data.get("udf4", ""),
+        data.get("udf3", ""),
+        data.get("udf2", ""),
+        data.get("udf1", ""),
+        data.get("email", ""),
+        data.get("firstname", ""),
+        data.get("productinfo", ""),
+        data.get("amount", ""),
+        txnid,
+        PAYU_MERCHANT_KEY,
+    ])
+    expected_hash = _payu_hash(reverse_str)
+    if not hmac.compare_digest(expected_hash.lower(), received_hash.lower()):
+        logger.warning(f"PayU webhook hash mismatch for txnid={txnid}")
+        raise HTTPException(status_code=400, detail="Invalid hash")
+
+    mihpayid = data.get("mihpayid", "")
+
+    if status == "success" and txnid:
+        pending = await db.payments.find_one(
+            {"payu_txnid": txnid, "status": "pending"},
+        )
+        if pending:
+            await db.payments.update_one(
+                {"id": pending["id"]},
+                {"$set": {
+                    "payu_mihpayid": mihpayid,
+                    "status": "success",
+                    "paid_at": datetime.now(timezone.utc).isoformat(),
+                    "webhook_captured_at": datetime.now(timezone.utc).isoformat(),
+                }},
+            )
+            booking = await db.bookings.find_one({"booking_id": pending["booking_id"]}, {"_id": 0})
+            if booking:
+                paid_amount = round(booking.get("paid_amount", 0) + pending["amount"], 2)
+                balance = round(booking["total_amount"] - paid_amount, 2)
+                await db.bookings.update_one(
+                    {"id": pending["booking_id"]},
+                    {"$set": {
+                        "status": "confirmed",
+                        "paid_amount": paid_amount,
+                        "balance_amount": max(balance, 0),
+                        "payment_type": "full" if abs(balance) < 0.01 else "partial",
+                    }},
+                )
+    elif status == "failure" and txnid:
+        await db.payments.update_one(
+            {"payu_txnid": txnid},
+            {"$set": {"status": "failed", "webhook_failed_at": datetime.now(timezone.utc).isoformat()}},
+        )
+
+    return {"ok": True}
+
 
 
 @api_router.post("/admin/bookings/{booking_id}/mark-balance-paid")
@@ -1338,10 +1473,9 @@ async def admin_mark_balance_paid(booking_id: str, admin: dict = Depends(require
         "booking_id": booking_id,
         "amount": balance,
         "payment_type": "balance_cash",
-        "razorpay_order_id": None,
-        "razorpay_payment_id": None,
+        "payu_txnid": None,
+        "payu_mihpayid": None,
         "status": "success",
-        "is_balance_charge": True,
         "paid_at": datetime.now(timezone.utc).isoformat(),
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
@@ -1353,33 +1487,6 @@ async def admin_mark_balance_paid(booking_id: str, admin: dict = Depends(require
     return {"ok": True}
 
 
-@api_router.post("/payments/webhook")
-async def razorpay_webhook(request: Request):
-    """Idempotent async confirmation. Only active when RAZORPAY_WEBHOOK_SECRET is set."""
-    if not RAZORPAY_WEBHOOK_SECRET:
-        return {"status": "webhook_disabled"}
-    body = await request.body()
-    signature = request.headers.get("X-Razorpay-Signature", "")
-    expected = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, signature):
-        raise HTTPException(status_code=400, detail="Invalid signature")
-    import json as _json
-    event = _json.loads(body.decode())
-    event_type = event.get("event")
-    entity = (event.get("payload", {}).get("payment") or {}).get("entity") or {}
-    payment_id = entity.get("id")
-    order_id = entity.get("order_id")
-    if event_type == "payment.captured" and order_id:
-        await db.payments.update_one(
-            {"razorpay_order_id": order_id},
-            {"$set": {"razorpay_payment_id": payment_id, "status": "success", "webhook_captured_at": datetime.now(timezone.utc).isoformat()}},
-        )
-    elif event_type == "payment.failed" and order_id:
-        await db.payments.update_one(
-            {"razorpay_order_id": order_id},
-            {"$set": {"status": "failed", "webhook_failed_at": datetime.now(timezone.utc).isoformat()}},
-        )
-    return {"ok": True}
 
 
 @api_router.get("/admin/payments")

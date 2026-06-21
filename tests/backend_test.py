@@ -301,12 +301,12 @@ class TestE2EFlow:
         })
         assert r.status_code == 200, r.text
         init = r.json()
-        assert init["order_id"].startswith("order_mock_")
+        assert init["txnid"].startswith("RC_TEST_")
         expected_partial = round(state["booking_total"] * 0.2, 2)
         assert abs(init["amount"] - expected_partial) < 0.01
 
         r2 = customer_session.post(f"{API}/payments/verify", json={
-            "booking_id": state["booking_id"], "payment_id": "pay_mock_123"
+            "booking_id": state["booking_id"], "txnid": init["txnid"]
         })
         assert r2.status_code == 200, r2.text
         b = r2.json()

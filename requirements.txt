@@ -93,7 +93,7 @@ python-jose==3.5.0
 python-multipart==0.0.24
 pytokens==0.4.1
 PyYAML==6.0.3
-razorpay==2.0.1
+# razorpay removed — using PayU via httpx (already listed above)
 referencing==0.37.0
 regex==2026.4.4
 requests==2.33.1
