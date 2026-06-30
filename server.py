@@ -666,7 +666,61 @@ async def delete_vehicle(vehicle_id: str, admin: dict = Depends(require_admin)):
     return {"ok": True}
 
 
-# ------------- File upload (generic) -------------
+# ------------- Price Hike (surge pricing) -------------
+
+@api_router.get("/admin/price-hike")
+async def get_price_hike(admin: dict = Depends(require_admin)):
+    """Return the current global price hike multiplier (1.0 = normal pricing)."""
+    doc = await db.settings.find_one({"key": "price_hike"}, {"_id": 0})
+    if not doc:
+        return {"multiplier": 1.0, "applied_at": None, "applied_by": None}
+    return doc
+
+
+@api_router.post("/admin/price-hike")
+async def set_price_hike(multiplier: float, admin: dict = Depends(require_admin)):
+    """Apply a global price multiplier (1.0–2.0) to all vehicle base prices.
+
+    On the first hike ever, seeds base_price_per_24hrs so future adjustments
+    always multiply from the original price (no compounding).
+    """
+    if not (1.0 <= multiplier <= 2.0):
+        raise HTTPException(status_code=400, detail="Multiplier must be between 1.0 and 2.0")
+
+    multiplier = round(multiplier, 2)
+    vehicles = await db.vehicles.find({}, {"_id": 0}).to_list(500)
+
+    for v in vehicles:
+        # Seed the base price on first hike so we always multiply from the original
+        base = v.get("base_price_per_24hrs") or v["price_per_24hrs"]
+        new_price = round(base * multiplier, 2)
+        await db.vehicles.update_one(
+            {"id": v["id"]},
+            {"$set": {
+                "base_price_per_24hrs": base,
+                "price_per_24hrs": new_price,
+            }}
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+    await db.settings.update_one(
+        {"key": "price_hike"},
+        {"$set": {
+            "key": "price_hike",
+            "multiplier": multiplier,
+            "applied_at": now,
+            "applied_by": admin["id"],
+        }},
+        upsert=True,
+    )
+    return {
+        "ok": True,
+        "multiplier": multiplier,
+        "vehicles_updated": len(vehicles),
+        "applied_at": now,
+    }
+
+
 @api_router.post("/upload")
 async def upload_file(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
     ext = (file.filename.rsplit(".", 1)[-1] if file.filename and "." in file.filename else "bin").lower()
