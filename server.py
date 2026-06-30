@@ -1487,6 +1487,133 @@ async def admin_mark_balance_paid(booking_id: str, admin: dict = Depends(require
     return {"ok": True}
 
 
+class ManualBookingIn(BaseModel):
+    """Admin-created booking on behalf of a registered customer."""
+    customer_id: str
+    vehicle_id: str
+    pickup_location_id: str
+    dropoff_location_id: str
+    pickup_date: str           # YYYY-MM-DD
+    pickup_time: str           # HH:MM
+    dropoff_date: str          # YYYY-MM-DD
+    dropoff_time: str          # HH:MM
+    coupon_code: Optional[str] = None
+    payment_collection: Literal["none", "partial", "full"] = "none"
+    admin_notes: Optional[str] = None
+
+
+@api_router.post("/admin/bookings/manual", status_code=201)
+async def admin_create_manual_booking(payload: ManualBookingIn, admin: dict = Depends(require_admin)):
+    """Admin creates a confirmed booking on behalf of any registered customer.
+    
+    Bypasses KYC gate and payment gateway. Records payment_source='admin_cash' 
+    and created_by_admin=True for audit. Fires confirmation email asynchronously.
+    """
+    # 1. Validate customer exists and is a customer (not another admin)
+    customer = await db.users.find_one({"id": payload.customer_id, "role": "customer"}, {"_id": 0, "password_hash": 0})
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    # 2. Validate vehicle exists
+    vehicle = await db.vehicles.find_one({"id": payload.vehicle_id}, {"_id": 0})
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+
+    # 3. Validate business hours
+    _validate_business_hours(payload.pickup_time)
+    _validate_business_hours(payload.dropoff_time)
+
+    # 4. Parse and validate dates
+    try:
+        pickup_dt = datetime.fromisoformat(f"{payload.pickup_date}T{payload.pickup_time}")
+        dropoff_dt = datetime.fromisoformat(f"{payload.dropoff_date}T{payload.dropoff_time}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date/time format")
+    if dropoff_dt <= pickup_dt:
+        raise HTTPException(status_code=400, detail="Dropoff must be after pickup")
+
+    # 5. Resolve coupon (optional)
+    coupon_doc = None
+    if payload.coupon_code:
+        coupon_doc = await db.discount_coupons.find_one(
+            {"code": payload.coupon_code.strip().upper()}, {"_id": 0}
+        )
+        if not coupon_doc:
+            raise HTTPException(status_code=404, detail="Coupon code not found")
+
+    # 6. Compute pricing using customer ID so first-booking discount applies correctly
+    pricing = await _compute_full_pricing(vehicle, pickup_dt, dropoff_dt, payload.customer_id, coupon_doc=coupon_doc)
+    total_payable = pricing["total_payable"]
+
+    # 7. Compute payment amounts based on admin's collection choice
+    if payload.payment_collection == "full":
+        paid_amount = total_payable
+        balance_amount = 0.0
+        payment_type = "full"
+    elif payload.payment_collection == "partial":
+        paid_amount = round(total_payable * 0.2, 2)
+        balance_amount = round(total_payable - paid_amount, 2)
+        payment_type = "partial"
+    else:  # "none"
+        paid_amount = 0.0
+        balance_amount = total_payable
+        payment_type = None
+
+    # 8. Build and insert the booking document
+    booking_id = str(uuid.uuid4())
+    doc = {
+        "id": booking_id,
+        "user_id": payload.customer_id,
+        "vehicle_id": payload.vehicle_id,
+        "vehicle_name": vehicle["name"],
+        "vehicle_image": (vehicle.get("image_urls") or [None])[0],
+        "pickup_location_id": payload.pickup_location_id,
+        "dropoff_location_id": payload.dropoff_location_id,
+        "pickup_date": payload.pickup_date,
+        "pickup_time": payload.pickup_time,
+        "dropoff_date": payload.dropoff_date,
+        "dropoff_time": payload.dropoff_time,
+        # Pricing breakdown
+        "rental_days": pricing["rental_days"],
+        "rent_amount": pricing["rental_amount"],
+        "long_term_discount_amount": pricing["long_term_discount"],
+        "long_term_discount_pct": pricing["long_term_discount_pct"],
+        "first_booking_discount_amount": pricing["first_booking_discount"],
+        "first_booking_discount_pct": pricing["first_booking_discount_pct"],
+        "applied_coupon_code": pricing["applied_coupon_code"],
+        "coupon_discount_amount": pricing["coupon_discount"],
+        "tax_amount": pricing["tax_amount"],
+        "tax_rate_pct": pricing["tax_rate_pct"],
+        "rental_amount_before_tax": pricing["taxable_amount"],
+        "final_amount": pricing["final_amount"],
+        "deposit_amount": pricing["deposit_amount"],
+        "total_amount": total_payable,
+        # Status & payment
+        "status": "confirmed",
+        "payment_type": payment_type,
+        "payment_source": "admin_cash",
+        "paid_amount": paid_amount,
+        "balance_amount": balance_amount,
+        # Audit fields
+        "created_by_admin": True,
+        "created_by_admin_id": admin["id"],
+        "admin_notes": payload.admin_notes,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.bookings.insert_one(doc)
+    doc.pop("_id", None)
+
+    # 9. Increment coupon usage counter
+    if coupon_doc:
+        await db.discount_coupons.update_one(
+            {"id": coupon_doc["id"]},
+            {"$inc": {"used_count": 1}}
+        )
+
+    # 10. Fire confirmation email asynchronously — never block the response
+    asyncio.create_task(send_booking_received_email(customer, doc))
+
+    return doc
 
 
 @api_router.get("/admin/payments")
