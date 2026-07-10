@@ -2370,6 +2370,28 @@ async def list_customers(admin: dict = Depends(require_admin)):
     return [serialize_user(u) | {"booking_count": u.get("booking_count", 0)} for u in users]
 
 
+@api_router.post("/admin/customers")
+async def admin_create_customer(payload: RegisterPayload, admin: dict = Depends(require_admin)):
+    """Admin-only: create a customer account directly without issuing auth cookies."""
+    email = payload.email.lower()
+    existing = await db.users.find_one({"email": email})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    user_id = str(uuid.uuid4())
+    doc = {
+        "id": user_id,
+        "email": email,
+        "password_hash": hash_password(payload.password),
+        "name": payload.name,
+        "phone": payload.phone,
+        "role": "customer",
+        "kyc_status": "not_submitted",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.users.insert_one(doc)
+    return serialize_user(doc) | {"booking_count": 0}
+
+
 @api_router.get("/admin/customers/{customer_id}")
 async def get_customer_detail(customer_id: str, admin: dict = Depends(require_admin)):
     u = await db.users.find_one({"id": customer_id, "role": "customer"}, {"_id": 0, "password_hash": 0})
@@ -2382,6 +2404,66 @@ async def get_customer_detail(customer_id: str, admin: dict = Depends(require_ad
     total_spent = sum(b.get("paid_amount", 0) or 0 for b in bookings)
     customer["total_spent"] = total_spent
     return {"customer": customer, "bookings": bookings, "kyc_documents": kyc_docs}
+
+
+@api_router.post("/admin/customers/{customer_id}/kyc")
+async def admin_upload_kyc_for_customer(
+    customer_id: str,
+    document_type: str = Form(...),
+    file: UploadFile = File(...),
+    admin: dict = Depends(require_admin),
+):
+    """Admin-only: upload a KYC document on behalf of a customer."""
+    u = await db.users.find_one({"id": customer_id, "role": "customer"}, {"_id": 0, "password_hash": 0})
+    if not u:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    if document_type not in KYC_DOC_TYPES:
+        raise HTTPException(status_code=400, detail=f"Invalid document type. Must be one of: {', '.join(sorted(KYC_DOC_TYPES))}")
+    ext = (file.filename.rsplit(".", 1)[-1] if file.filename and "." in file.filename else "bin").lower()
+    if ext not in {"jpg", "jpeg", "png", "pdf"}:
+        raise HTTPException(status_code=400, detail="Only JPG/PNG/PDF allowed")
+    data = await file.read()
+    resource_type = "raw" if ext == "pdf" else "image"
+    result = cloudinary_upload(data, folder=f"kyc/{customer_id}", resource_type=resource_type)
+    secure_url = result.get("secure_url")
+    public_id = result.get("public_id")
+    content_type = file.content_type or ("application/pdf" if ext == "pdf" else "image/jpeg")
+    await db.files.insert_one({
+        "id": str(uuid.uuid4()),
+        "public_id": public_id,
+        "secure_url": secure_url,
+        "resource_type": resource_type,
+        "original_filename": file.filename,
+        "content_type": content_type,
+        "size": result.get("bytes", len(data)),
+        "owner_id": customer_id,
+        "is_deleted": False,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    # Replace previous pending doc of this type
+    prev_docs = await db.kyc_documents.find({
+        "user_id": customer_id, "document_type": document_type,
+        "verification_status": {"$ne": "approved"},
+    }).to_list(10)
+    for p in prev_docs:
+        if p.get("public_id"):
+            cloudinary_destroy(p["public_id"], resource_type=p.get("resource_type", "image"))
+    await db.kyc_documents.delete_many({
+        "user_id": customer_id, "document_type": document_type,
+        "verification_status": {"$ne": "approved"},
+    })
+    doc_id = str(uuid.uuid4())
+    kyc_doc = {
+        "id": doc_id, "user_id": customer_id, "document_type": document_type,
+        "file_url": secure_url, "public_id": public_id, "resource_type": resource_type,
+        "content_type": content_type,
+        "verification_status": "pending", "admin_notes": None,
+        "verified_by": None, "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.kyc_documents.insert_one(kyc_doc)
+    await db.users.update_one({"id": customer_id}, {"$set": {"kyc_status": "pending"}})
+    kyc_doc.pop("_id", None)
+    return kyc_doc
 
 
 # ------------- Health -------------
