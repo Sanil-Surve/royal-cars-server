@@ -30,9 +30,9 @@ JWT_SECRET = os.environ["JWT_SECRET"]
 ADMIN_EMAIL = os.environ["ADMIN_EMAIL"]
 ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
 APP_NAME = os.environ.get("APP_NAME", "royalcars")
-# FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://royalrentalcars.in")
-FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
-COOKIE_SECURE = not FRONTEND_URL.startswith("http://")
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://royalrentalcars.in")
+# FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
+COOKIE_SECURE = not FRONTEND_URL.startswith("https://")
 COOKIE_SAMESITE = "none" if COOKIE_SECURE else "lax"
 
 JWT_ALGORITHM = "HS256"
